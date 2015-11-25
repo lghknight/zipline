@@ -31,6 +31,7 @@ from six import (
 )
 from operator import attrgetter
 
+
 from zipline.errors import (
     AddTermPostInit,
     OrderDuringInitialize,
@@ -41,6 +42,7 @@ from zipline.errors import (
     UnsupportedCommissionModel,
     UnsupportedOrderParameters,
     UnsupportedSlippageModel,
+    UnsupportedDatetimeFormat,
 )
 from zipline.finance.trading import TradingEnvironment
 from zipline.finance.blotter import Blotter
@@ -146,7 +148,7 @@ class TradingAlgorithm(object):
                Whether to fill orders immediately or on next bar.
             asset_finder : An AssetFinder object
                 A new AssetFinder object to be used in this TradingEnvironment
-            asset_metadata: can be either:
+            equities_metadata : can be either:
                             - dict
                             - pandas.DataFrame
                             - object with 'read' property
@@ -164,7 +166,7 @@ class TradingAlgorithm(object):
                 with the other metadata fields.
             identifiers : List
                 Any asset identifiers that are not provided in the
-                asset_metadata, but will be traded by this TradingAlgorithm
+                equities_metadata, but will be traded by this TradingAlgorithm
         """
         self.sources = []
 
@@ -175,7 +177,7 @@ class TradingAlgorithm(object):
         self.account_controls = []
 
         self._recorded_vars = {}
-        self.namespace = kwargs.get('namespace', {})
+        self.namespace = kwargs.pop('namespace', {})
 
         self._platform = kwargs.pop('platform', 'zipline')
 
@@ -189,26 +191,36 @@ class TradingAlgorithm(object):
 
         self.instant_fill = kwargs.pop('instant_fill', False)
 
+        # If an env has been provided, pop it
+        self.trading_environment = kwargs.pop('env', None)
+
+        if self.trading_environment is None:
+            self.trading_environment = TradingEnvironment()
+
+        # Update the TradingEnvironment with the provided asset metadata
+        self.trading_environment.write_data(
+            equities_data=kwargs.pop('equities_metadata', {}),
+            equities_identifiers=kwargs.pop('identifiers', []),
+            futures_data=kwargs.pop('futures_metadata', {}),
+        )
+
         # set the capital base
         self.capital_base = kwargs.pop('capital_base', DEFAULT_CAPITAL_BASE)
-
         self.sim_params = kwargs.pop('sim_params', None)
         if self.sim_params is None:
             self.sim_params = create_simulation_parameters(
                 capital_base=self.capital_base,
                 start=kwargs.pop('start', None),
-                end=kwargs.pop('end', None)
+                end=kwargs.pop('end', None),
+                env=self.trading_environment,
             )
-        self.perf_tracker = PerformanceTracker(self.sim_params)
+        else:
+            self.sim_params.update_internal_from_env(self.trading_environment)
 
-        # Update the TradingEnvironment with the provided asset metadata
-        self.trading_environment = kwargs.pop('env',
-                                              TradingEnvironment.instance())
-        self.trading_environment.update_asset_finder(
-            asset_finder=kwargs.pop('asset_finder', None),
-            asset_metadata=kwargs.pop('asset_metadata', None),
-            identifiers=kwargs.pop('identifiers', None)
-        )
+        # Build a perf_tracker
+        self.perf_tracker = PerformanceTracker(sim_params=self.sim_params,
+                                               env=self.trading_environment)
+
         # Pull in the environment's new AssetFinder for quick reference
         self.asset_finder = self.trading_environment.asset_finder
         self.init_engine(kwargs.pop('ffc_loader', None))
@@ -224,6 +236,10 @@ class TradingAlgorithm(object):
 
         # Set the dt initally to the period start by forcing it to change
         self.on_dt_changed(self.sim_params.period_start)
+
+        # The symbol lookup date specifies the date to use when resolving
+        # symbols to sids, and can be set using set_symbol_lookup_date()
+        self._symbol_lookup_date = None
 
         self.portfolio_needs_update = True
         self.account_needs_update = True
@@ -320,13 +336,13 @@ class TradingAlgorithm(object):
         functions.
         """
         with ZiplineAPI(self):
-            self._initialize(self)
+            self._initialize(self, *args, **kwargs)
 
-    def before_trading_start(self):
+    def before_trading_start(self, data):
         if self._before_trading_start is None:
             return
 
-        self._before_trading_start(self)
+        self._before_trading_start(self, data)
 
     def handle_data(self, data):
         self._most_recent_data = data
@@ -436,7 +452,9 @@ class TradingAlgorithm(object):
         if self.perf_tracker is None:
             # HACK: When running with the `run` method, we set perf_tracker to
             # None so that it will be overwritten here.
-            self.perf_tracker = PerformanceTracker(sim_params)
+            self.perf_tracker = PerformanceTracker(
+                sim_params=sim_params, env=self.trading_environment
+            )
 
         self.portfolio_needs_update = True
         self.account_needs_update = True
@@ -495,18 +513,17 @@ class TradingAlgorithm(object):
             # if DataFrame provided, map columns to sids and wrap
             # in DataFrameSource
             copy_frame = source.copy()
-            copy_frame.columns = \
-                self.asset_finder.map_identifier_index_to_sids(
-                    source.columns, source.index[0]
-                )
+            copy_frame.columns = self._write_and_map_id_index_to_sids(
+                source.columns, source.index[0],
+            )
             source = DataFrameSource(copy_frame)
 
         elif isinstance(source, pd.Panel):
             # If Panel provided, map items to sids and wrap
             # in DataPanelSource
             copy_panel = source.copy()
-            copy_panel.items = self.asset_finder.map_identifier_index_to_sids(
-                source.items, source.major_axis[0]
+            copy_panel.items = self._write_and_map_id_index_to_sids(
+                source.items, source.major_axis[0],
             )
             source = DataPanelSource(copy_panel)
 
@@ -523,7 +540,9 @@ class TradingAlgorithm(object):
                 self.sim_params.period_end = source.end
             # Changing period_start and period_close might require updating
             # of first_open and last_close.
-            self.sim_params._update_internal()
+            self.sim_params.update_internal_from_env(
+                env=self.trading_environment
+            )
 
         # The sids field of the source is the reference for the universe at
         # the start of the run
@@ -551,6 +570,7 @@ class TradingAlgorithm(object):
                 self.current_universe(),
                 self.sim_params.first_open,
                 self.sim_params.data_frequency,
+                self.trading_environment,
             )
 
         # loop through simulated_trading, each iteration returns a
@@ -565,6 +585,30 @@ class TradingAlgorithm(object):
         self.analyze(daily_stats)
 
         return daily_stats
+
+    def _write_and_map_id_index_to_sids(self, identifiers, as_of_date):
+        # Build new Assets for identifiers that can't be resolved as
+        # sids/Assets
+        identifiers_to_build = []
+        for identifier in identifiers:
+            asset = None
+
+            if isinstance(identifier, Asset):
+                asset = self.asset_finder.retrieve_asset(sid=identifier.sid,
+                                                         default_none=True)
+
+            elif hasattr(identifier, '__int__'):
+                asset = self.asset_finder.retrieve_asset(sid=identifier,
+                                                         default_none=True)
+            if asset is None:
+                identifiers_to_build.append(identifier)
+
+        self.trading_environment.write_data(
+            equities_identifiers=identifiers_to_build)
+
+        return self.asset_finder.map_identifier_index_to_sids(
+            identifiers, as_of_date,
+        )
 
     def _create_daily_stats(self, perfs):
         # create daily and cumulative stats dataframe
@@ -693,9 +737,15 @@ class TradingAlgorithm(object):
         Default symbol lookup for any source that directly maps the
         symbol to the Asset (e.g. yahoo finance).
         """
-        return self.asset_finder.lookup_symbol_resolve_multiple(
+        # If the user has not set the symbol lookup date,
+        # use the period_end as the date for sybmol->sid resolution.
+        _lookup_date = self._symbol_lookup_date if self._symbol_lookup_date is not None \
+            else self.sim_params.period_end
+
+        return self.asset_finder.lookup_symbol(
             symbol_str,
-            as_of_date=self.datetime)
+            as_of_date=_lookup_date,
+        )
 
     @api_method
     def symbols(self, *args):
@@ -736,6 +786,12 @@ class TradingAlgorithm(object):
         RootSymbolNotFound
             If a future chain could not be found for the given root symbol.
         """
+        if as_of_date:
+            try:
+                as_of_date = pd.Timestamp(as_of_date, tz='UTC')
+            except ValueError:
+                raise UnsupportedDatetimeFormat(input=as_of_date,
+                                                method='future_chain')
         return FutureChain(
             asset_finder=self.asset_finder,
             get_datetime=self.get_datetime,
@@ -985,6 +1041,19 @@ class TradingAlgorithm(object):
             raise OverrideCommissionPostInit()
         self.commission = commission
 
+    @api_method
+    def set_symbol_lookup_date(self, dt):
+        """
+        Set the date for which symbols will be resolved to their sids
+        (symbols may map to different firms or underlying assets at
+        different times)
+        """
+        try:
+            self._symbol_lookup_date = pd.Timestamp(dt, tz='UTC')
+        except ValueError:
+            raise UnsupportedDatetimeFormat(input=dt,
+                                            method='set_symbol_lookup_date')
+
     def set_sources(self, sources):
         assert isinstance(sources, list)
         self.sources = sources
@@ -1103,7 +1172,8 @@ class TradingAlgorithm(object):
     def add_history(self, bar_count, frequency, field, ffill=True):
         data_frequency = self.sim_params.data_frequency
         history_spec = HistorySpec(bar_count, frequency, field, ffill,
-                                   data_frequency=data_frequency)
+                                   data_frequency=data_frequency,
+                                   env=self.trading_environment)
         self.history_specs[history_spec.key_str] = history_spec
         if self.initialized:
             if self.history_container:
@@ -1116,6 +1186,7 @@ class TradingAlgorithm(object):
                     self.current_universe(),
                     self.sim_params.first_open,
                     self.sim_params.data_frequency,
+                    env=self.trading_environment,
                 )
 
     def get_history_spec(self, bar_count, frequency, field, ffill):
@@ -1128,6 +1199,7 @@ class TradingAlgorithm(object):
                 field,
                 ffill,
                 data_frequency=data_freq,
+                env=self.trading_environment,
             )
             self.history_specs[spec_key] = spec
             if not self.history_container:
@@ -1137,6 +1209,7 @@ class TradingAlgorithm(object):
                     self.datetime,
                     self.sim_params.data_frequency,
                     bar_data=self._most_recent_data,
+                    env=self.trading_environment,
                 )
             self.history_container.ensure_spec(
                 spec, self.datetime, self._most_recent_data,
@@ -1283,13 +1356,24 @@ class TradingAlgorithm(object):
 
     def compute_factor_matrix(self, start_date):
         """
-        Compute a factor matrix starting at start_date.
+        Compute a factor matrix containing at least the data necessary to
+        provide values for `start_date`.
+
+        Loads a factor matrix with data extending from `start_date` until a
+        year from `start_date`, or until the end of the simulation.
         """
         days = self.trading_environment.trading_days
+
+        # Load data starting from the previous trading day...
         start_date_loc = days.get_loc(start_date)
+
+        # ...continuing until either the day before the simulation end, or
+        # until 252 days of data have been loaded.  252 is a totally arbitrary
+        # choice that seemed reasonable based on napkin math.
         sim_end = self.sim_params.last_close.normalize()
         end_loc = min(start_date_loc + 252, days.get_loc(sim_end))
         end_date = days[end_loc]
+
         return self.engine.factor_matrix(
             self._all_terms(),
             start_date,

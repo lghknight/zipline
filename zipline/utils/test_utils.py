@@ -284,11 +284,11 @@ def make_simple_asset_info(assets, start_date, end_date, symbols=None):
     Parameters
     ----------
     assets : array-like
-    start_date : pd.DatetimeIndex
-    end_date : pd.DatetimeIndex
+    start_date : pd.Timestamp
+    end_date : pd.Timestamp
     symbols : list, optional
         Symbols to use for the assets.
-        If not provided, symbols are generated from upper-case letters.
+        If not provided, symbols are generated from the sequence 'A', 'B', ...
 
     Returns
     -------
@@ -322,3 +322,18 @@ def check_arrays(left, right, err_msg='', verbose=True):
     if type(left) != type(right):
         raise AssertionError("%s != %s" % (type(left), type(right)))
     return assert_array_equal(left, right, err_msg=err_msg, verbose=True)
+
+
+class UnexpectedAttributeAccess(Exception):
+    pass
+
+
+class ExplodingObject(object):
+    """
+    Object that will raise an exception on any attribute access.
+
+    Useful for verifying that an object is never touched during a
+    function/method call.
+    """
+    def __getattribute__(self, name):
+        raise UnexpectedAttributeAccess(name)

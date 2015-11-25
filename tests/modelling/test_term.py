@@ -4,7 +4,6 @@ Tests for Term.
 from itertools import product
 from unittest import TestCase
 
-from networkx import topological_sort
 from numpy import (
     float32,
     uint32,
@@ -20,9 +19,10 @@ from zipline.errors import (
     TermInputsNotSpecified,
     WindowLengthNotSpecified,
 )
-from zipline.modelling.engine import build_dependency_graph
-from zipline.modelling.factor import Factor
 from zipline.modelling.expression import NUMEXPR_MATH_FUNCS
+from zipline.modelling.factor import Factor
+from zipline.modelling.graph import TermGraph
+from zipline.modelling.term import AssetExists, NotSpecified
 
 
 class SomeDataSet(DataSet):
@@ -55,18 +55,33 @@ def gen_equivalent_factors():
     object.
     """
     yield SomeFactor()
-    yield SomeFactor(inputs=None)
+    yield SomeFactor(inputs=NotSpecified)
     yield SomeFactor(SomeFactor.inputs)
     yield SomeFactor(inputs=SomeFactor.inputs)
     yield SomeFactor([SomeDataSet.foo, SomeDataSet.bar])
     yield SomeFactor(window_length=SomeFactor.window_length)
-    yield SomeFactor(window_length=None)
-    yield SomeFactor([SomeDataSet.foo, SomeDataSet.bar], window_length=None)
+    yield SomeFactor(window_length=NotSpecified)
+    yield SomeFactor(
+        [SomeDataSet.foo, SomeDataSet.bar],
+        window_length=NotSpecified,
+    )
     yield SomeFactor(
         [SomeDataSet.foo, SomeDataSet.bar],
         window_length=SomeFactor.window_length,
     )
     yield SomeFactorAlias()
+
+
+def to_dict(l):
+    """
+    Convert a list to a dict with keys drawn from '0', '1', '2', ...
+
+    Example
+    -------
+    >>> to_dict([2, 3, 4])
+    {'0': 2, '1': 3, '2': 4}
+    """
+    return dict(zip(map(str, range(len(l))), l))
 
 
 class DependencyResolutionTestCase(TestCase):
@@ -81,16 +96,14 @@ class DependencyResolutionTestCase(TestCase):
         """
         Test dependency resolution for a single factor.
         """
-
-        build_dependency_graph([SomeFactor()])
-
         def check_output(graph):
 
-            resolution_order = topological_sort(graph)
+            resolution_order = list(graph.ordered())
 
-            self.assertEqual(len(resolution_order), 3)
+            self.assertEqual(len(resolution_order), 4)
+            self.assertIs(resolution_order[0], AssetExists())
             self.assertEqual(
-                set([resolution_order[0], resolution_order[1]]),
+                set([resolution_order[1], resolution_order[2]]),
                 set([SomeDataSet.foo, SomeDataSet.bar]),
             )
             self.assertEqual(resolution_order[-1], SomeFactor())
@@ -98,29 +111,34 @@ class DependencyResolutionTestCase(TestCase):
             self.assertEqual(graph.node[SomeDataSet.bar]['extra_rows'], 4)
 
         for foobar in gen_equivalent_factors():
-            check_output(build_dependency_graph([foobar]))
+            check_output(TermGraph(to_dict([foobar])))
 
     def test_single_factor_instance_args(self):
         """
         Test dependency resolution for a single factor with arguments passed to
         the constructor.
         """
-        graph = build_dependency_graph(
-            [SomeFactor([SomeDataSet.bar, SomeDataSet.buzz], window_length=5)]
-        )
-        resolution_order = topological_sort(graph)
+        bar, buzz = SomeDataSet.bar, SomeDataSet.buzz
+        graph = TermGraph(to_dict([SomeFactor([bar, buzz], window_length=5)]))
 
-        self.assertEqual(len(resolution_order), 3)
+        resolution_order = list(graph.ordered())
+
+        # SomeFactor, its inputs, and AssetExists()
+        self.assertEqual(len(resolution_order), 4)
+
+        self.assertIs(resolution_order[0], AssetExists())
+        self.assertEqual(graph.extra_rows[AssetExists()], 4)
+
         self.assertEqual(
-            set([resolution_order[0], resolution_order[1]]),
-            set([SomeDataSet.bar, SomeDataSet.buzz]),
+            set([resolution_order[1], resolution_order[2]]),
+            set([bar, buzz]),
         )
         self.assertEqual(
             resolution_order[-1],
-            SomeFactor([SomeDataSet.bar, SomeDataSet.buzz], window_length=5),
+            SomeFactor([bar, buzz], window_length=5),
         )
-        self.assertEqual(graph.node[SomeDataSet.bar]['extra_rows'], 4)
-        self.assertEqual(graph.node[SomeDataSet.buzz]['extra_rows'], 4)
+        self.assertEqual(graph.extra_rows[bar], 4)
+        self.assertEqual(graph.extra_rows[buzz], 4)
 
     def test_reuse_atomic_terms(self):
         """
@@ -129,15 +147,17 @@ class DependencyResolutionTestCase(TestCase):
         f1 = SomeFactor([SomeDataSet.foo, SomeDataSet.bar])
         f2 = SomeOtherFactor([SomeDataSet.bar, SomeDataSet.buzz])
 
-        graph = build_dependency_graph([f1, f2])
-        resolution_order = topological_sort(graph)
+        graph = TermGraph(to_dict([f1, f2]))
+        resolution_order = list(graph.ordered())
 
         # bar should only appear once.
-        self.assertEqual(len(resolution_order), 5)
+        self.assertEqual(len(resolution_order), 6)
         indices = {
             term: resolution_order.index(term)
             for term in resolution_order
         }
+
+        self.assertEqual(indices[AssetExists()], 0)
 
         # Verify that f1's dependencies will be computed before f1.
         self.assertLess(indices[SomeDataSet.foo], indices[f1])

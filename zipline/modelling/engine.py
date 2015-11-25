@@ -8,19 +8,14 @@ from abc import (
 from operator import and_
 from six import (
     iteritems,
+    itervalues,
     with_metaclass,
 )
 from six.moves import (
     reduce,
-    zip,
     zip_longest,
 )
 
-from networkx import (
-    DiGraph,
-    get_node_attributes,
-    topological_sort,
-)
 from numpy import (
     add,
     empty_like,
@@ -33,86 +28,13 @@ from pandas import (
 
 from zipline.lib.adjusted_array import ensure_ndarray
 from zipline.errors import NoFurtherDataError
-from zipline.modelling.factor import Factor
-from zipline.modelling.filter import Filter
+from zipline.utils.pandas_utils import explode
 
-
-# TODO: Move this somewhere else.
-class CyclicDependency(Exception):
-    pass
-
-
-def build_dependency_graph(terms):
-    """
-    Build a dependency graph containing the given terms and their dependencies.
-
-    Parameters
-    ----------
-    terms : iterable
-        An iterable of zipline.modelling.term.Term.
-
-    Returns
-    -------
-    dependencies : networkx.DiGraph
-        A directed graph representing the dependencies of the desired inputs.
-
-        Each node in the graph has an `extra_rows` attribute, indicating how
-        many, if any, extra rows we should compute for the node.  Extra rows
-        are most often needed when a term is an input to a rolling window
-        computation.  For example, if we compute a 30 day moving average of
-        price from day X to day Y, we need to load price data for the range
-        from day (X - 29) to day Y.
-    """
-    dependencies = DiGraph()
-    parents = set()
-    for term in terms:
-        _add_to_graph(
-            term,
-            dependencies,
-            parents,
-            extra_rows=0,
-        )
-        # No parents should be left between top-level terms.
-        assert not parents
-    return dependencies
-
-
-def _add_to_graph(term,
-                  dependencies,
-                  parents,
-                  extra_rows):
-    """
-    Add the term and all its inputs to dependencies.
-    """
-    # If we've seen this node already as a parent of the current traversal,
-    # it means we have an unsatisifiable dependency.  This should only be
-    # possible if the term's inputs are mutated after construction.
-    if term in parents:
-        raise CyclicDependency(term)
-    parents.add(term)
-
-    try:
-        existing = dependencies.node[term]
-    except KeyError:
-        # We're not yet in the graph: add the term with the specified number of
-        # extra rows.
-        dependencies.add_node(term, extra_rows=extra_rows)
-    else:
-        # We're already in the graph because we've been traversed by
-        # another parent.  Ensure that we have enough extra rows to satisfy
-        # all of our parents.
-        existing['extra_rows'] = max(extra_rows, existing['extra_rows'])
-
-    for subterm in term.inputs:
-        _add_to_graph(
-            subterm,
-            dependencies,
-            parents,
-            extra_rows=extra_rows + term.extra_input_rows,
-        )
-        dependencies.add_edge(subterm, term)
-
-    parents.remove(term)
+from .classifier import Classifier
+from .factor import Factor
+from .filter import Filter
+from .graph import TermGraph
+from .term import AssetExists
 
 
 class FFCEngine(with_metaclass(ABCMeta)):
@@ -129,17 +51,18 @@ class FFCEngine(with_metaclass(ABCMeta)):
 
         Parameters
         ----------
-        terms : dict
-            Map from str -> zipline.modelling.term.Term.
-        start_date : datetime
-            The first date of the matrix.
-        end_date : datetime
-            The last date of the matrix.
+        terms : dict[str -> zipline.modelling.term.Term]
+            Dict mapping term names to instances.  The supplied names are used
+            as column names in our output frame.
+        start_date : pd.Timestamp
+            Start date of the computed matrix.
+        end_date : pd.Timestamp
+            End date of the computed matrix.
 
         Returns
         -------
         matrix : pd.DataFrame
-            A matrix of factors
+            A matrix of computed results.
         """
         raise NotImplementedError("factor_matrix")
 
@@ -149,10 +72,10 @@ class NoOpFFCEngine(FFCEngine):
     FFCEngine that doesn't do anything.
     """
 
-    def factor_matrix(self, terms, start, end):
+    def factor_matrix(self, terms, start_date, end_date):
         return DataFrame(
             index=MultiIndex.from_product(
-                [date_range(start=start, end=end, freq='D'), ()],
+                [date_range(start=start_date, end=end_date, freq='D'), ()],
             ),
             columns=sorted(terms.keys())
         )
@@ -177,6 +100,7 @@ class SimpleFFCEngine(object):
         '_loader',
         '_calendar',
         '_finder',
+        '_root_mask_term',
         '__weakref__',
     ]
 
@@ -184,6 +108,7 @@ class SimpleFFCEngine(object):
         self._loader = loader
         self._calendar = calendar
         self._finder = asset_finder
+        self._root_mask_term = AssetExists()
 
     def factor_matrix(self, terms, start_date, end_date):
         """
@@ -223,8 +148,8 @@ class SimpleFFCEngine(object):
 
         5. Stick the values computed in (4) into a DataFrame and return it.
 
-        Step 0 is performed in `build_dependency_graph`.
-        Step 1 is performed in `self.build_lifetimes_matrix`.
+        Step 0 is performed by `zipline.modelling.graph.TermGraph`.
+        Step 1 is performed in `self._compute_root_mask`.
         Step 2 is performed in `self.compute_chunk`.
         Steps 3, 4, and 5 are performed in self._format_factor_matrix.
 
@@ -238,49 +163,38 @@ class SimpleFFCEngine(object):
                 "start_date=%s, end_date=%s" % (start_date, end_date)
             )
 
-        graph = build_dependency_graph(terms.values())
-        ordered_terms = topological_sort(graph)
-        extra_row_counts = get_node_attributes(graph, 'extra_rows')
-        max_extra_rows = max(extra_row_counts.values())
+        graph = TermGraph(terms)
+        extra_rows = graph.extra_rows[self._root_mask_term]
 
-        lifetimes = self.build_lifetimes_matrix(
-            start_date,
-            end_date,
-            max_extra_rows,
-        )
-        lifetimes_between_dates = lifetimes[max_extra_rows:]
-
-        dates = lifetimes_between_dates.index.values
-        assets = lifetimes_between_dates.columns.values
-
+        root_mask = self._compute_root_mask(start_date, end_date, extra_rows)
+        dates, assets, root_mask_values = explode(root_mask)
         raw_outputs = self.compute_chunk(
-            ordered_terms,
-            extra_row_counts,
-            lifetimes,
-        )
-
-        # We only need filters and factors to compute the final output matrix.
-        raw_filters = [lifetimes_between_dates.values]
-        raw_factors = []
-        factor_names = []
-        for name, term in iteritems(terms):
-            extra = extra_row_counts[term]
-            if isinstance(term, Factor):
-                factor_names.append(name)
-                raw_factors.append(raw_outputs[term][extra:])
-
-            elif isinstance(term, Filter):
-                raw_filters.append(raw_outputs[term][extra:])
-
-        return self._format_factor_matrix(
+            graph,
             dates,
             assets,
-            raw_filters,
-            raw_factors,
-            factor_names,
+            initial_workspace={self._root_mask_term: root_mask_values},
         )
 
-    def build_lifetimes_matrix(self, start_date, end_date, extra_rows):
+        # Collect the results that we'll actually show to the user.
+        filters, factors = {}, {}
+        for name, term in iteritems(terms):
+            if isinstance(term, Filter):
+                filters[name] = raw_outputs[name]
+            elif isinstance(term, Factor):
+                factors[name] = raw_outputs[name]
+            elif isinstance(term, Classifier):
+                continue
+            else:
+                raise ValueError("Unknown term type: %s" % term)
+
+        # Add the root mask as an implicit filter, truncating off the extra
+        # rows that we only needed to compute other terms.
+        filters['base'] = root_mask_values[extra_rows:]
+        out_dates = dates[extra_rows:]
+
+        return self._format_factor_matrix(out_dates, assets, filters, factors)
+
+    def _compute_root_mask(self, start_date, end_date, extra_rows):
         """
         Compute a lifetimes matrix from our AssetFinder, then drop columns that
         didn't exist at all during the query dates.
@@ -292,9 +206,9 @@ class SimpleFFCEngine(object):
         end_date : pd.Timestamp
             End date for the matrix.
         extra_rows : int
-            Number of rows prior to `start_date` to include.
+            Number of extra rows to compute before `start_date`.
             Extra rows are needed by terms like moving averages that require a
-            trailing window of data to compute.
+            trailing window of data.
 
         Returns
         -------
@@ -318,11 +232,13 @@ class SimpleFFCEngine(object):
                 ),
             )
 
-        # Build lifetimes matrix reaching back as far start_date plus
-        # max_extra_rows.
+        # Build lifetimes matrix reaching back to `extra_rows` days before
+        # `start_date.`
         lifetimes = finder.lifetimes(
-            calendar[start_idx - extra_rows:end_idx]
+            calendar[start_idx - extra_rows:end_idx],
+            include_start_date=False
         )
+
         assert lifetimes.index[extra_rows] == start_date
         assert lifetimes.index[-1] == end_date
         if not lifetimes.columns.unique:
@@ -335,101 +251,138 @@ class SimpleFFCEngine(object):
         existed = lifetimes.iloc[extra_rows:].any()
         return lifetimes.loc[:, existed]
 
-    def _inputs_for_term(self, term, workspace, extra_row_counts):
+    def _mask_and_dates_for_term(self, term, workspace, graph, dates):
+        """
+        Load mask and mask row labels for term.
+        """
+        mask = term.mask
+        offset = graph.extra_rows[mask] - graph.extra_rows[term]
+        return workspace[mask][offset:], dates[offset:]
+
+    def _inputs_for_term(self, term, workspace, graph):
         """
         Compute inputs for the given term.
 
-        This is mostly complicated by the fact that for each input we store
-        as many rows as will be necessary to serve any term requiring that
-        input.  Thus if Factor A needs 5 extra rows of price, and Factor B
-        needs 3 extra rows of price, we need to remove 2 leading rows from our
-        stored prices before passing them to Factor B.
+        This is mostly complicated by the fact that for each input we store as
+        many rows as will be necessary to serve **any** computation requiring
+        that input.
         """
-        term_extra_rows = term.extra_input_rows
+        offsets = graph.offset
         if term.windowed:
+            # If term is windowed, then all input data should be instances of
+            # AdjustedArray.
             return [
                 workspace[input_].traverse(
-                    term.window_length,
-                    offset=extra_row_counts[input_] - term_extra_rows
-                )
-                for input_ in term.inputs
-            ]
-        else:
-            return [
-                ensure_ndarray(
-                    workspace[input_][
-                        extra_row_counts[input_] - term_extra_rows:
-                    ],
+                    window_length=term.window_length,
+                    offset=offsets[term, input_]
                 )
                 for input_ in term.inputs
             ]
 
-    def compute_chunk(self, ordered_terms, extra_row_counts, base_mask):
-        """
-        Compute the FFC terms in the graph based on the assets and dates
-        defined by base_mask.
+        # If term is not windowed, input_data may be an AdjustedArray or
+        # np.ndarray.  Coerce the former to the latter.
+        out = []
+        for input_ in term.inputs:
+            input_data = ensure_ndarray(workspace[input_])
+            offset = offsets[term, input_]
+            # OPTIMIZATION: Don't make a copy by doing input_data[0:] if
+            # offset is zero.
+            if offset:
+                input_data = input_data[offset:]
+            out.append(input_data)
+        return out
 
-        Returns a dictionary mapping terms to computed arrays.
+    def compute_chunk(self, graph, dates, assets, initial_workspace):
         """
+        Compute the FFC terms in the graph for the requested start and end
+        dates.
+
+        Parameters
+        ----------
+        graph : zipline.modelling.graph.TermGraph
+        dates : pd.DatetimeIndex
+            Row labels for our root mask.
+        assets : pd.Int64Index
+            Column labels for our root mask.
+        initial_workspace : dict
+            Map from term -> output.
+            Must contain at least entry for `self._root_mask_term` whose shape
+            is `(len(dates), len(assets))`, but may contain additional
+            pre-computed terms for testing or optimization purposes.
+
+        Returns
+        -------
+        results : dict
+            Dictionary mapping requested results to outputs.
+        """
+        self._validate_compute_chunk_params(dates, assets, initial_workspace)
         loader = self._loader
-        max_extra_rows = max(extra_row_counts.values())
-        workspace = {term: None for term in ordered_terms}
 
-        for term in ordered_terms:
-            base_mask_for_term = base_mask.iloc[
-                max_extra_rows - extra_row_counts[term]:
-            ]
+        # Copy the supplied initial workspace so we don't mutate it in place.
+        workspace = initial_workspace.copy()
+
+        for term in graph.ordered():
+            # `term` may have been supplied in `initial_workspace`, and in the
+            # future we may pre-compute atomic terms coming from the same
+            # dataset.  In either case, we will already have an entry for this
+            # term, which we shouldn't re-compute.
+            if term in workspace:
+                continue
+
+            # Asset labels are always the same, but date labels vary by how
+            # many extra rows are needed.
+            mask, mask_dates = self._mask_and_dates_for_term(
+                term, workspace, graph, dates
+            )
             if term.atomic:
                 # FUTURE OPTIMIZATION: Scan the resolution order for terms in
                 # the same dataset and load them here as well.
                 to_load = [term]
                 loaded = loader.load_adjusted_array(
-                    to_load,
-                    base_mask_for_term,
+                    to_load, mask_dates, assets, mask,
                 )
+                assert len(to_load) == len(loaded)
                 for loaded_term, adj_array in zip_longest(to_load, loaded):
                     workspace[loaded_term] = adj_array
             else:
-                if term.windowed:
-                    compute = term.compute_from_windows
-                else:
-                    compute = term.compute_from_arrays
-                workspace[term] = compute(
-                    self._inputs_for_term(term, workspace, extra_row_counts),
-                    base_mask_for_term,
+                workspace[term] = term._compute(
+                    self._inputs_for_term(term, workspace, graph),
+                    mask_dates,
+                    assets,
+                    mask,
                 )
-        return workspace
+                assert(workspace[term].shape == mask.shape)
 
-    def _format_factor_matrix(self,
-                              dates,
-                              assets,
-                              filter_data,
-                              factor_data,
-                              factor_names):
+        out = {}
+        graph_extra_rows = graph.extra_rows
+        for name, term in iteritems(graph.outputs):
+            # Truncate off extra rows from outputs.
+            out[name] = workspace[term][graph_extra_rows[term]:]
+        return out
+
+    def _format_factor_matrix(self, dates, assets, filters, factors):
         """
         Convert raw computed filters/factors into a DataFrame for public APIs.
 
         Parameters
         ----------
         dates : np.array[datetime64]
-            Index for raw data in filter_data/factor_data.
+            Row index for arrays in `filters` and `factors.`
         assets : np.array[int64]
-            Column labels for raw data in filter_data/factor_data.
-        filter_data : list[ndarray[bool]]
-            Raw filters data.
-        factor_data : list[ndarray]
-            Raw factor data.
-        factor_names : list[str]
-            Names of factors to use as keys.
+            Column index for arrays in `filters` and `factors.`
+        filters : dict
+            Dict mapping filter names -> computed filters.
+        factors : dict
+            Dict mapping factor names -> computed factors.
 
         Returns
         -------
         factor_matrix : pd.DataFrame
-            A DataFrame with the following indices:
+            The indices of `factor_matrix` are as follows:
 
-            index : two-tiered MultiIndex of (date, asset).  For each date, we
-                return a row for each asset that passed all filters on that
-                date.
+            index : two-tiered MultiIndex of (date, asset).
+                For each date, we return a row for each asset that passed all
+                filters on that date.
             columns : keys from `factor_data`
 
         Each date/asset/factor triple contains the computed value of the given
@@ -438,19 +391,28 @@ class SimpleFFCEngine(object):
         # FUTURE OPTIMIZATION: Cythonize all of this.
 
         # Boolean mask of values that passed all filters.
-        unioned = reduce(and_, filter_data)
+        unioned = reduce(and_, itervalues(filters))
 
-        # Parallel arrays of (x,y) coords for all date/asset pairs that passed
+        # Parallel arrays of (x,y) coords for (date, asset) pairs that passed
         # all filters.  Each entry here will correspond to a row in our output
         # frame.
         nonzero_xs, nonzero_ys = unioned.nonzero()
 
+        # Raw arrays storing (date, asset) pairs.
+        # These will form the index of our output frame.
         raw_dates_index = empty_like(nonzero_xs, dtype='datetime64[ns]')
         raw_assets_index = empty_like(nonzero_xs, dtype=int)
-        factor_outputs = [
-            empty_like(nonzero_xs, dtype=factor.dtype)
-            for factor in factor_data
-        ]
+
+        # Mapping from column_name -> array.
+        # This will be the `data` arg to our output frame.
+        columns = {
+            name: empty_like(nonzero_xs, dtype=factor.dtype)
+            for name, factor in iteritems(factors)
+        }
+        # We're going to iterate over `iteritems(columns)` a whole bunch of
+        # times down below.  It's faster to construct iterate over a tuple of
+        # pairs.
+        columns_iter = tuple(iteritems(columns))
 
         # This is tricky.
 
@@ -462,26 +424,60 @@ class SimpleFFCEngine(object):
         # each date, the running total of the number of assets that passed our
         # filters on or before that date.
 
-        # This means that (bounds[i - 1], bounds[i]) gives us the slice bounds
-        # of rows in our output DataFrame corresponding to each date.
-        dt_start = 0
+        # This means that (bounds[i - 1], bounds[i]) gives us the indices of
+        # the first and last rows in our output frame for each date in `dates`.
         bounds = add.accumulate(unioned.sum(axis=1))
-        for dt_idx, dt_end in enumerate(bounds):
+        day_start = 0
+        for day_idx, day_end in enumerate(bounds):
 
-            row_bounds = slice(dt_start, dt_end)
-            column_indices = nonzero_ys[row_bounds]
+            day_bounds = slice(day_start, day_end)
+            column_indices = nonzero_ys[day_bounds]
 
-            raw_dates_index[row_bounds] = dates[dt_idx]
-            raw_assets_index[row_bounds] = assets[column_indices]
-            for computed, output in zip(factor_data, factor_outputs):
-                output[row_bounds] = computed[dt_idx, column_indices]
+            raw_dates_index[day_bounds] = dates[day_idx]
+            raw_assets_index[day_bounds] = assets[column_indices]
+            for name, colarray in columns_iter:
+                colarray[day_bounds] = factors[name][day_idx, column_indices]
 
             # Upper bound of current row becomes lower bound for next row.
-            dt_start = dt_end
+            day_start = day_end
 
         return DataFrame(
-            dict(zip(factor_names, factor_outputs)),
+            data=columns,
             index=MultiIndex.from_arrays(
-                [raw_dates_index, raw_assets_index],
+                [
+                    raw_dates_index,
+                    # FUTURE OPTIMIZATION:
+                    # Avoid duplicate lookups by grouping and only looking up
+                    # each unique sid once.
+                    self._finder.retrieve_all(raw_assets_index),
+                ],
             )
         ).tz_localize('UTC', level=0)
+
+    def _validate_compute_chunk_params(self, dates, assets, initial_workspace):
+        """
+        Verify that the values passed to compute_chunk are well-formed.
+        """
+        root = self._root_mask_term
+        clsname = type(self).__name__
+        # Writing this out explicitly so this errors in testing if we change
+        # the name without updating this line.
+        compute_chunk_name = self.compute_chunk.__name__
+        if root not in initial_workspace:
+            raise AssertionError(
+                "root_mask values not supplied to {cls}.{method}".format(
+                    cls=clsname,
+                    method=compute_chunk_name,
+                )
+            )
+
+        shape = initial_workspace[root].shape
+        implied_shape = len(dates), len(assets)
+        if shape != implied_shape:
+            raise AssertionError(
+                "root_mask shape is {shape}, but received dates/assets "
+                "imply that shape should be {implied}".format(
+                    shape=shape,
+                    implied=implied_shape,
+                )
+            )
