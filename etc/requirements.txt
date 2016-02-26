@@ -34,20 +34,20 @@ bottleneck==1.0.0
 
 contextlib2==0.4.0
 
-# Graph algorithms used by zipline.modelling
+# Graph algorithms used by zipline.pipeline
 networkx==1.9.1
 
-# NumericalExpression modelling terms.
+# NumericalExpression pipeline terms.
 numexpr==2.4.3
 
-# On disk storage format for modelling data.
+# On disk storage format for pipeline data.
 bcolz==0.10.0
 
 # Command line interface helper
 click==4.0.0
 
 # FUNctional programming utilities
-toolz==0.7.2
+toolz==0.7.4
 
 # Asset writer and finder
 sqlalchemy==1.0.8

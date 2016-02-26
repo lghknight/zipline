@@ -12,12 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from copy import copy
 
 from six import iteritems, iterkeys
 import pandas as pd
-from pandas.tseries.tools import normalize_date
 import numpy as np
 
 from . utils.protocol_utils import Enum
@@ -378,7 +376,7 @@ class SIDData(object):
         else:
             return buffer_[self._sid][-bars:]
 
-    def _get_bars(self, days):
+    def _cache_daily_minutely(self, days, fn):
         """
         Gets the number of bars needed for the current number of days.
 
@@ -440,8 +438,20 @@ class SIDData(object):
             self._get_bars = minute_get_bars
             self._get_max_bars = minute_get_max_bars
 
+        # NOTE: This silently adds these two entries to the `__dict__`
+        # without affecting the `__len__` of the object. This is important
+        # because we use the `len` of the `SIDData` object to see if we have
+        # data for this asset.
+        self._initial_len += 2
+
         # Not actually recursive because we have already cached the new method.
-        return self._get_bars(days)
+        return getattr(self, fn)(days)
+
+    def _get_bars(self, bars):
+        return self._cache_daily_minutely(bars, fn='_get_bars')
+
+    def _get_max_bars(self, bars):
+        return self._cache_daily_minutely(bars, fn='_get_max_bars')
 
     def mavg(self, days):
         bars = self._get_bars(days)
@@ -494,24 +504,6 @@ class BarData(object):
     def __init__(self, data=None):
         self._data = data or {}
         self._contains_override = None
-        self._factor_matrix = None
-        self._factor_matrix_expires = pd.Timestamp(0, tz='UTC')
-
-    @property
-    def factors(self):
-        algo = get_algo_instance()
-        today = normalize_date(algo.get_datetime())
-        if today > self._factor_matrix_expires:
-            self._factor_matrix, self._factor_matrix_expires = \
-                algo.compute_factor_matrix(today)
-        try:
-            return self._factor_matrix.loc[today]
-        except KeyError:
-            # This happens if no assets passed our filters on a given day.
-            return pd.DataFrame(
-                index=[],
-                columns=self._factor_matrix.columns,
-            )
 
     def __contains__(self, name):
         if self._contains_override:

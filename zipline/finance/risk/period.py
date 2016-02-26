@@ -100,12 +100,9 @@ class RiskMetricsPeriod(object):
         self.num_trading_days = len(self.benchmark_returns)
         self.trading_day_counts = pd.stats.moments.rolling_count(
             self.algorithm_returns, self.num_trading_days)
-        self.mean_algorithm_returns = pd.Series(
-            index=self.algorithm_returns.index)
-        for dt, ret in self.algorithm_returns.iteritems():
-            self.mean_algorithm_returns[dt] = (
-                self.algorithm_returns[:dt].sum() /
-                self.trading_day_counts[dt])
+
+        self.mean_algorithm_returns = \
+            self.algorithm_returns.cumsum() / self.trading_day_counts
 
         self.benchmark_volatility = self.calculate_volatility(
             self.benchmark_returns)
@@ -255,13 +252,19 @@ class RiskMetricsPeriod(object):
         http://en.wikipedia.org/wiki/Beta_(finance)
         """
         # it doesn't make much sense to calculate beta for less than two days,
-        # so return none.
+        # so return nan.
         if len(self.algorithm_returns) < 2:
-            return 0.0, 0.0, 0.0, 0.0, []
+            return np.nan, np.nan, np.nan, np.nan, []
 
         returns_matrix = np.vstack([self.algorithm_returns,
                                     self.benchmark_returns])
         C = np.cov(returns_matrix, ddof=1)
+
+        # If there are missing benchmark values, then we can't calculate the
+        # beta.
+        if not np.isfinite(C).all():
+            return np.nan, np.nan, np.nan, np.nan, []
+
         eigen_values = la.eigvals(C)
         condition_number = max(eigen_values) / min(eigen_values)
         algorithm_covariance = C[0][1]

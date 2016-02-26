@@ -18,7 +18,6 @@
 Factory functions to prepare useful data.
 """
 import pytz
-import random
 
 import pandas as pd
 import numpy as np
@@ -28,7 +27,9 @@ from zipline.protocol import Event, DATASOURCE_TYPE
 from zipline.sources import (SpecificEquityTrades,
                              DataFrameSource,
                              DataPanelSource)
-from zipline.finance.trading import SimulationParameters, TradingEnvironment
+from zipline.finance.trading import (
+    SimulationParameters, TradingEnvironment, noop_load
+)
 from zipline.sources.test_source import create_trade
 
 
@@ -41,19 +42,18 @@ __all__ = ['load_from_yahoo', 'load_bars_from_yahoo']
 
 def create_simulation_parameters(year=2006, start=None, end=None,
                                  capital_base=float("1.0e5"),
-                                 num_days=None, load=None,
+                                 num_days=None,
                                  data_frequency='daily',
                                  emission_rate='daily',
                                  env=None):
-    """Construct a complete environment with reasonable defaults"""
     if env is None:
-        env = TradingEnvironment(load=load)
+        # Construct a complete environment with reasonable defaults
+        env = TradingEnvironment(load=noop_load)
     if start is None:
         start = datetime(year, 1, 1, tzinfo=pytz.utc)
     if end is None:
         if num_days:
-            start_index = env.trading_days.searchsorted(
-                start)
+            start_index = env.trading_days.searchsorted(start)
             end = env.trading_days[start_index + num_days - 1]
         else:
             end = datetime(year, 12, 31, tzinfo=pytz.utc)
@@ -67,38 +67,6 @@ def create_simulation_parameters(year=2006, start=None, end=None,
     )
 
     return sim_params
-
-
-def create_random_simulation_parameters():
-    env = TradingEnvironment()
-    treasury_curves = env.treasury_curves
-
-    for n in range(100):
-
-        random_index = random.randint(
-            0,
-            len(treasury_curves) - 1
-        )
-
-        start_dt = treasury_curves.index[random_index]
-        end_dt = start_dt + timedelta(days=365)
-
-        now = datetime.utcnow().replace(tzinfo=pytz.utc)
-
-        if end_dt <= now:
-            break
-
-    assert end_dt <= now, """
-failed to find a suitable daterange after 100 attempts. please double
-check treasury and benchmark data in findb, and re-run the test."""
-
-    sim_params = SimulationParameters(
-        period_start=start_dt,
-        period_end=end_dt,
-        env=env,
-    )
-
-    return sim_params, start_dt, end_dt
 
 
 def get_next_trading_dt(current, interval, env):
@@ -296,7 +264,7 @@ def create_test_df_source(sim_params=None, env=None, bars='daily'):
         index = sim_params.trading_days
     else:
         if env is None:
-            env = TradingEnvironment()
+            env = TradingEnvironment(load=noop_load)
 
         start = pd.datetime(1990, 1, 3, 0, 0, 0, 0, pytz.utc)
         end = pd.datetime(1990, 1, 8, 0, 0, 0, 0, pytz.utc)
@@ -327,7 +295,7 @@ def create_test_panel_source(sim_params=None, env=None, source_type=None):
         if sim_params else pd.datetime(1990, 1, 8, 0, 0, 0, 0, pytz.utc)
 
     if env is None:
-        env = TradingEnvironment()
+        env = TradingEnvironment(load=noop_load)
 
     index = env.days_in_range(start, end)
 
