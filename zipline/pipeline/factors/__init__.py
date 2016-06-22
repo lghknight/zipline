@@ -1,10 +1,27 @@
 from .factor import (
-    Factor,
     CustomFactor,
+    Factor,
+    Latest,
+    RecarrayField,
 )
-from .latest import Latest
+from .events import (
+    BusinessDaysSincePreviousEvent,
+    BusinessDaysUntilNextEvent,
+)
 from .technical import (
+    Aroon,
+    AverageDollarVolume,
+    BollingerBands,
+    EWMA,
+    EWMSTD,
+    ExponentialWeightedMovingAverage,
+    ExponentialWeightedMovingStdDev,
+    FastStochasticOscillator,
     MaxDrawdown,
+    Returns,
+    RollingLinearRegressionOfReturns,
+    RollingPearsonOfReturns,
+    RollingSpearmanOfReturns,
     RSI,
     SimpleMovingAverage,
     VWAP,
@@ -12,10 +29,25 @@ from .technical import (
 )
 
 __all__ = [
+    'Aroon',
+    'AverageDollarVolume',
+    'BollingerBands',
+    'BusinessDaysSincePreviousEvent',
+    'BusinessDaysUntilNextEvent',
     'CustomFactor',
+    'EWMA',
+    'EWMSTD',
+    'ExponentialWeightedMovingAverage',
+    'ExponentialWeightedMovingStdDev',
     'Factor',
+    'FastStochasticOscillator',
     'Latest',
     'MaxDrawdown',
+    'RecarrayField',
+    'Returns',
+    'RollingLinearRegressionOfReturns',
+    'RollingPearsonOfReturns',
+    'RollingSpearmanOfReturns',
     'RSI',
     'SimpleMovingAverage',
     'VWAP',

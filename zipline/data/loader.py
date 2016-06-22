@@ -1,5 +1,5 @@
 #
-# Copyright 2013 Quantopian, Inc.
+# Copyright 2016 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,29 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from __future__ import print_function
 import os
 from collections import OrderedDict
 
 import logbook
-
 import pandas as pd
-from pandas.io.data import DataReader
+from pandas_datareader.data import DataReader
 import pytz
-
 from six import iteritems
+from six.moves.urllib_error import HTTPError
 
-from . benchmarks import get_benchmark_returns
+from .benchmarks import get_benchmark_returns
 from . import treasuries, treasuries_can
-from .paths import (
+from ..utils.paths import (
     cache_root,
     data_root,
 )
-
-from zipline.utils.tradingcalendar import (
-    trading_day as trading_day_nyse,
-    trading_days as trading_days_nyse,
-)
+from ..utils.deprecate import deprecated
+from zipline.utils.calendars import get_calendar
 
 logger = logbook.Logger('Loader')
 
@@ -49,6 +44,10 @@ INDEX_MAPPING = {
 }
 
 ONE_HOUR = pd.Timedelta(hours=1)
+
+nyse_cal = get_calendar('NYSE')
+trading_day_nyse = nyse_cal.day
+trading_days_nyse = nyse_cal.all_trading_days
 
 
 def last_modified_time(path):
@@ -156,7 +155,7 @@ def load_market_data(trading_day=trading_day_nyse,
     # before this date.
     last_date = trading_days[trading_days.get_loc(now, method='ffill') - 2]
 
-    benchmark_returns = ensure_benchmark_data(
+    br = ensure_benchmark_data(
         bm_symbol,
         first_date,
         last_date,
@@ -165,12 +164,14 @@ def load_market_data(trading_day=trading_day_nyse,
         # date so that we can compute returns for the first date.
         trading_day,
     )
-    treasury_curves = ensure_treasury_data(
+    tc = ensure_treasury_data(
         bm_symbol,
         first_date,
         last_date,
         now,
     )
+    benchmark_returns = br[br.index.slice_indexer(first_date, last_date)]
+    treasury_curves = tc[tc.index.slice_indexer(first_date, last_date)]
     return benchmark_returns, treasury_curves
 
 
@@ -204,29 +205,33 @@ def ensure_benchmark_data(symbol, first_date, last_date, now, trading_day):
     path.
     """
     path = get_data_filepath(get_benchmark_filename(symbol))
-    try:
-        data = pd.Series.from_csv(path).tz_localize('UTC')
-        if has_data_for_dates(data, first_date, last_date):
-            return data
 
-        # Don't re-download if we've successfully downloaded and written a file
-        # in the last hour.
-        last_download_time = last_modified_time(path)
-        if (now - last_download_time) <= ONE_HOUR:
-            logger.warn(
-                "Refusing to download new benchmark "
-                "data because a download succeeded at %s." % last_download_time
-            )
-            return data
+    # If the path does not exist, it means the first download has not happened
+    # yet, so don't try to read from 'path'.
+    if os.path.exists(path):
+        try:
+            data = pd.Series.from_csv(path).tz_localize('UTC')
+            if has_data_for_dates(data, first_date, last_date):
+                return data
 
-    except (OSError, IOError, ValueError) as e:
-        # These can all be raised by various versions of pandas on various
-        # classes of malformed input.  Treat them all as cache misses.
-        logger.info(
-            "Loading data for {path} failed with error [{error}].".format(
-                path=path, error=e,
+            # Don't re-download if we've successfully downloaded and written a
+            # file in the last hour.
+            last_download_time = last_modified_time(path)
+            if (now - last_download_time) <= ONE_HOUR:
+                logger.warn(
+                    "Refusing to download new benchmark data because a "
+                    "download succeeded at %s." % last_download_time
+                )
+                return data
+
+        except (OSError, IOError, ValueError) as e:
+            # These can all be raised by various versions of pandas on various
+            # classes of malformed input.  Treat them all as cache misses.
+            logger.info(
+                "Loading data for {path} failed with error [{error}].".format(
+                    path=path, error=e,
+                )
             )
-        )
     logger.info(
         "Cache at {path} does not have data from {start} to {end}.\n"
         "Downloading benchmark data for '{symbol}'.",
@@ -236,8 +241,15 @@ def ensure_benchmark_data(symbol, first_date, last_date, now, trading_day):
         path=path,
     )
 
-    data = get_benchmark_returns(symbol, first_date - trading_day, last_date)
-    data.to_csv(path)
+    try:
+        data = get_benchmark_returns(
+            symbol,
+            first_date - trading_day,
+            last_date,
+        )
+        data.to_csv(path)
+    except (OSError, IOError, HTTPError):
+        logger.exception('failed to cache the new benchmark returns')
     if not has_data_for_dates(data, first_date, last_date):
         logger.warn("Still don't have expected data after redownload!")
     return data
@@ -275,32 +287,39 @@ def ensure_treasury_data(bm_symbol, first_date, last_date, now):
     )
     first_date = max(first_date, loader_module.earliest_possible_date())
     path = get_data_filepath(filename)
+
+    # If the path does not exist, it means the first download has not happened
+    # yet, so don't try to read from 'path'.
+    if os.path.exists(path):
+        try:
+            data = pd.DataFrame.from_csv(path).tz_localize('UTC')
+            if has_data_for_dates(data, first_date, last_date):
+                return data
+
+            # Don't re-download if we've successfully downloaded and written a
+            # file in the last hour.
+            last_download_time = last_modified_time(path)
+            if (now - last_download_time) <= ONE_HOUR:
+                logger.warn(
+                    "Refusing to download new treasury data because a "
+                    "download succeeded at %s." % last_download_time
+                )
+                return data
+
+        except (OSError, IOError, ValueError) as e:
+            # These can all be raised by various versions of pandas on various
+            # classes of malformed input.  Treat them all as cache misses.
+            logger.info(
+                "Loading data for {path} failed with error [{error}].".format(
+                    path=path, error=e,
+                )
+            )
+
     try:
-        data = pd.DataFrame.from_csv(path).tz_localize('UTC')
-        if has_data_for_dates(data, first_date, last_date):
-            return data
-
-        # Don't re-download if we've successfully downloaded and written a file
-        # in the last hour.
-        last_download_time = last_modified_time(path)
-        if (now - last_download_time) <= ONE_HOUR:
-            logger.warn(
-                "Refusing to download new treasury "
-                "data because a download succeeded at %s." % last_download_time
-            )
-            return data
-
-    except (OSError, IOError, ValueError) as e:
-        # These can all be raised by various versions of pandas on various
-        # classes of malformed input.  Treat them all as cache misses.
-        logger.info(
-            "Loading data for {path} failed with error [{error}].".format(
-                path=path, error=e,
-            )
-        )
-
-    data = loader_module.get_treasury_data(first_date, last_date)
-    data.to_csv(path)
+        data = loader_module.get_treasury_data(first_date, last_date)
+        data.to_csv(path)
+    except (OSError, IOError, HTTPError):
+        logger.exception('failed to cache treasury data')
     if not has_data_for_dates(data, first_date, last_date):
         logger.warn("Still don't have expected data after redownload!")
     return data
@@ -337,7 +356,7 @@ must specify stocks or indexes"""
 
     if stocks is not None:
         for stock in stocks:
-            print(stock)
+            logger.info('Loading stock: {}'.format(stock))
             stock_pathsafe = stock.replace(os.path.sep, '--')
             cache_filename = "{stock}-{start}-{end}.csv".format(
                 stock=stock_pathsafe,
@@ -353,7 +372,7 @@ must specify stocks or indexes"""
 
     if indexes is not None:
         for name, ticker in iteritems(indexes):
-            print(name)
+            logger.info('Loading index: {} ({})'.format(name, ticker))
             stkd = DataReader(ticker, 'yahoo', start, end).sort_index()
             data[name] = stkd
 
@@ -393,6 +412,10 @@ def load_from_yahoo(indexes=None,
     return df
 
 
+@deprecated(
+    'load_bars_from_yahoo is deprecated, please register a'
+    ' yahoo_equities data bundle instead',
+)
 def load_bars_from_yahoo(indexes=None,
                          stocks=None,
                          start=None,

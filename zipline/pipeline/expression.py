@@ -8,12 +8,12 @@ from numbers import Number
 import numexpr
 from numexpr.necompiler import getExprNames
 from numpy import (
-    empty,
-    find_common_type,
+    full,
     inf,
 )
 
-from zipline.pipeline.term import Term, NotSpecified, CompositeTerm
+from zipline.pipeline.term import Term, ComputableTerm
+
 
 _VARIABLE_NAME_RE = re.compile("^(x_)([0-9]+)$")
 
@@ -54,6 +54,11 @@ _ops_to_commuted_methods = {
     '>=': '__le__',
     '>': '__lt__',
 }
+_unary_ops_to_methods = {
+    '-': '__neg__',
+    '~': '__invert__',
+}
+
 UNARY_OPS = {'-'}
 MATH_BINOPS = {'+', '-', '*', '/', '**', '%'}
 FILTER_BINOPS = {'&', '|'}  # NumExpr doesn't support xor.
@@ -151,42 +156,32 @@ def method_name_for_op(op, commute=False):
     return _ops_to_methods[op]
 
 
+def unary_op_name(op):
+    return _unary_ops_to_methods[op]
+
+
 def is_comparison(op):
     return op in COMPARISONS
 
 
-class NumericalExpression(CompositeTerm):
+class NumericalExpression(ComputableTerm):
     """
     Term binding to a numexpr expression.
 
     Parameters
     ----------
     expr : string
-       A string suitable for passing to numexpr.  All variables in 'expr'
-       should be of the form "x_i", where i is the index of the corresponding
-       factor input in 'binds'.
+        A string suitable for passing to numexpr.  All variables in 'expr'
+        should be of the form "x_i", where i is the index of the corresponding
+        factor input in 'binds'.
     binds : tuple
-       A tuple of factors to use as inputs.
+        A tuple of factors to use as inputs.
+    dtype : np.dtype
+        The dtype for the expression.
     """
     window_length = 0
 
-    def __new__(cls, expr, binds):
-
-        # If our class doesn't have an explicit dtype set, infer one from the
-        # inputs.
-
-        # FIXME: This doesn't take into account dtypes of constants, so it will
-        # break if we have something like
-        #     factor(int64) + factor(int64) + 2.5.
-        # The real fix for this is probably for the calling context to specify
-        # dtypes.
-        if cls.dtype is not NotSpecified:
-            dtype = cls.dtype
-        else:
-            dtype = find_common_type(
-                [factor.dtype for factor in binds],
-                [],
-            )
+    def __new__(cls, expr, binds, dtype):
         return super(NumericalExpression, cls).__new__(
             cls,
             inputs=binds,
@@ -199,9 +194,9 @@ class NumericalExpression(CompositeTerm):
         return super(NumericalExpression, self)._init(*args, **kwargs)
 
     @classmethod
-    def static_identity(cls, expr, *args, **kwargs):
+    def _static_identity(cls, expr, *args, **kwargs):
         return (
-            super(NumericalExpression, cls).static_identity(*args, **kwargs),
+            super(NumericalExpression, cls)._static_identity(*args, **kwargs),
             expr,
         )
 
@@ -228,13 +223,13 @@ class NumericalExpression(CompositeTerm):
                     expected_indices, expr_indices,
                 )
             )
-        return super(NumericalExpression, self)._validate()
+        super(NumericalExpression, self)._validate()
 
     def _compute(self, arrays, dates, assets, mask):
         """
         Compute our stored expression string with numexpr.
         """
-        out = empty(mask.shape, dtype=self.dtype)
+        out = full(mask.shape, self.missing_value, dtype=self.dtype)
         # This writes directly into our output buffer.
         numexpr.evaluate(
             self._expr,
@@ -253,7 +248,18 @@ class NumericalExpression(CompositeTerm):
         new_inputs.
         """
         expr = self._expr
-        for idx, input_ in enumerate(self.inputs):
+
+        # If we have 11+ variables, some of our variable names may be
+        # substrings of other variable names. For example, we might have x_1,
+        # x_10, and x_100. By enumerating in reverse order, we ensure that
+        # every variable name which is a substring of another variable name is
+        # processed after the variable of which it is a substring. This
+        # guarantees that the substitution of any given variable index only
+        # ever affects exactly its own index. For example, if we have variables
+        # with indices going up to 100, we will process all of the x_1xx names
+        # before x_1x, which will be before x_1, so the substitution of x_1
+        # will not affect x_1x, which will not affect x_1xx.
+        for idx, input_ in reversed(list(enumerate(self.inputs))):
             old_varname = "x_%d" % idx
             # Temporarily rebind to x_temp_N so that we don't overwrite the
             # same value multiple times.

@@ -1,28 +1,35 @@
+.. image:: https://media.quantopian.com/logos/open_source/zipline-logo-03_.png
+    :target: http://www.zipline.io
+    :width: 212px
+    :align: center
+    :alt: Zipline
+
 Zipline
 =======
 
 |Gitter|
 |version status|
-|downloads|
-|build status|
+|travis status|
+|appveyor status|
 |Coverage Status|
-|Code quality|
 
 Zipline is a Pythonic algorithmic trading library. It is an event-driven
 system that supports both backtesting and live-trading.
 
 Zipline is currently used in production as the backtesting and live-trading
-engine powering `Quantopian <https://www.quantopian.com>`__ -- a free,
+engine powering `Quantopian <https://www.quantopian.com>`_ -- a free,
 community-centered, hosted platform for building and executing trading
 strategies.
 
 `Join our
-community! <https://groups.google.com/forum/#!forum/zipline>`__
+community! <https://groups.google.com/forum/#!forum/zipline>`_
+
+`Documentation <http://www.zipline.io>`_
 
 Want to contribute? See our `open
-requests <https://github.com/quantopian/zipline/wiki/Contribution-Requests>`__
+requests <https://github.com/quantopian/zipline/wiki/Contribution-Requests>`_
 and our `general
-guidelines <https://github.com/quantopian/zipline#contributions>`__
+guidelines <https://github.com/quantopian/zipline#contributions>`_
 below.
 
 Features
@@ -43,25 +50,49 @@ Features
 Installation
 ============
 
-pip
----
+Installing With ``pip``
+-----------------------
 
-You can install Zipline via the ``pip`` command:
-::
+Assuming you have all required (see note below) non-Python dependencies, you
+can install Zipline with ``pip`` via:
+
+.. code-block:: bash
 
     $ pip install zipline
 
+**Note:** Installing Zipline via ``pip`` is slightly more involved than the
+average Python package.  Simply running ``pip install zipline`` will likely
+fail if you've never installed any scientific Python packages before.
+
+There are two reasons for the additional complexity:
+
+1. Zipline ships several C extensions that require access to the CPython C API.
+   In order to build the C extensions, ``pip`` needs access to the CPython
+   header files for your Python installation.
+
+2. Zipline depends on `numpy <http://www.numpy.org/>`_, the core library for
+   numerical array computing in Python.  Numpy depends on having the `LAPACK
+   <http://www.netlib.org/lapack>`_ linear algebra routines available.
+
+Because LAPACK and the CPython headers are binary dependencies, the correct way
+to install them varies from platform to platform.  On Linux, users generally
+acquire these dependencies via a package manager like ``apt``, ``yum``, or
+``pacman``.  On OSX, `Homebrew <http://www.brew.sh>`_ is a popular choice
+providing similar functionality.
+
+See the full `Zipline Install Documentation`_ for more information on acquiring
+binary dependencies for your specific platform.
 
 conda
 -----
 
-Another way to install Zipline is via ``conda`` which comes as part
-of `Anaconda <http://continuum.io/downloads>`__ or can be installed via
-``pip install conda``.
+Another way to install Zipline is via the ``conda`` package manager, which
+comes as part of `Anaconda <http://continuum.io/downloads>`_ or can be
+installed via ``pip install conda``.
 
 Once set up, you can install Zipline from our ``Quantopian`` channel:
 
-::
+.. code-block:: bash
 
     conda install -c Quantopian zipline
 
@@ -69,29 +100,24 @@ Currently supported platforms include:
 
 -  GNU/Linux 64-bit
 -  OSX 64-bit
+-  Windows 64-bit
 
 .. note::
 
-   Windows may work; however, it is currently untested.
-
-Dependencies
-------------
-
-See our `requirements file
-<https://github.com/quantopian/zipline/blob/master/etc/requirements.txt>`__
+   Windows 32-bit may work; however, it is not currently included in
+   continuous integration tests.
 
 Quickstart
 ==========
 
 See our `getting started
-tutorial <http://www.zipline.io/#quickstart>`__.
+tutorial <http://www.zipline.io/#quickstart>`_.
 
 The following code implements a simple dual moving average algorithm.
 
 .. code:: python
 
     from zipline.api import (
-        add_history,
         history,
         order_target,
         record,
@@ -100,10 +126,6 @@ The following code implements a simple dual moving average algorithm.
 
 
     def initialize(context):
-        # Register 2 histories that track daily prices,
-        # one with a 100 window and one with a 300 day window
-        add_history(100, '1d', 'price')
-        add_history(300, '1d', 'price')
         context.i = 0
 
 
@@ -158,11 +180,11 @@ https://github.com/quantopian/zipline/wiki/Contribution-Requests
    :target: https://gitter.im/quantopian/zipline?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge
 .. |version status| image:: https://img.shields.io/pypi/pyversions/zipline.svg
    :target: https://pypi.python.org/pypi/zipline
-.. |downloads| image:: https://img.shields.io/pypi/dd/zipline.svg
-   :target: https://pypi.python.org/pypi/zipline
-.. |build status| image:: https://travis-ci.org/quantopian/zipline.png?branch=master
+.. |travis status| image:: https://travis-ci.org/quantopian/zipline.png?branch=master
    :target: https://travis-ci.org/quantopian/zipline
+.. |appveyor status| image:: https://ci.appveyor.com/api/projects/status/3dg18e6227dvstw6/branch/master?svg=true
+   :target: https://ci.appveyor.com/project/quantopian/zipline/branch/master
 .. |Coverage Status| image:: https://coveralls.io/repos/quantopian/zipline/badge.png
    :target: https://coveralls.io/r/quantopian/zipline
-.. |Code quality| image:: https://scrutinizer-ci.com/g/quantopian/zipline/badges/quality-score.png?b=master
-   :target: https://scrutinizer-ci.com/g/quantopian/zipline/
+
+.. _`Zipline Install Documentation` : http://www.zipline.io/install.html

@@ -1,15 +1,24 @@
 """
 Tests for zipline.utils.validate.
 """
+from operator import attrgetter
 from types import FunctionType
 from unittest import TestCase
+
 from nose_parameterized import parameterized
+from numpy import arange, array, dtype
+import pytz
+from six import PY3
 
 from zipline.utils.preprocess import call, preprocess
 from zipline.utils.input_validation import (
+    expect_dimensions,
+    ensure_timezone,
     expect_element,
+    expect_dtypes,
     expect_types,
     optional,
+    optionally,
 )
 
 
@@ -17,6 +26,13 @@ def noop(func, argname, argvalue):
     assert isinstance(func, FunctionType)
     assert isinstance(argname, str)
     return argvalue
+
+
+if PY3:
+    qualname = attrgetter('__qualname__')
+else:
+    def qualname(ob):
+        return '.'.join((__name__, ob.__name__))
 
 
 class PreprocessTestCase(TestCase):
@@ -180,9 +196,9 @@ class PreprocessTestCase(TestCase):
                 foo(not_int(1), 2, 3)
             self.assertEqual(
                 e.exception.args[0],
-                "{modname}.foo() expected a value of type "
+                "{qualname}() expected a value of type "
                 "int for argument 'a', but got {t} instead.".format(
-                    modname=foo.__module__,
+                    qualname=qualname(foo),
                     t=not_int.__name__,
                 )
             )
@@ -203,9 +219,9 @@ class PreprocessTestCase(TestCase):
             foo('1')
 
         expected_message = (
-            "{modname}.foo() expected a value of "
+            "{qualname}() expected a value of "
             "type int or float for argument 'a', but got str instead."
-        ).format(modname=foo.__module__)
+        ).format(qualname=qualname(foo))
         self.assertEqual(e.exception.args[0], expected_message)
 
     def test_expect_optional_types(self):
@@ -225,9 +241,9 @@ class PreprocessTestCase(TestCase):
             foo('1')
 
         expected_message = (
-            "{modname}.foo() expected a value of "
+            "{qualname}() expected a value of "
             "type int or NoneType for argument 'a', but got str instead."
-        ).format(modname=foo.__module__)
+        ).format(qualname=qualname(foo))
         self.assertEqual(e.exception.args[0], expected_message)
 
     def test_expect_element(self):
@@ -244,7 +260,146 @@ class PreprocessTestCase(TestCase):
             f('c')
 
         expected_message = (
-            "{modname}.f() expected a value in {set_!r}"
+            "{qualname}() expected a value in {set_!r}"
             " for argument 'a', but got 'c' instead."
-        ).format(set_=set_, modname=f.__module__)
+        ).format(set_=set_, qualname=qualname(f))
         self.assertEqual(e.exception.args[0], expected_message)
+
+    def test_expect_dtypes(self):
+
+        @expect_dtypes(a=dtype(float), b=dtype('datetime64[ns]'))
+        def foo(a, b, c):
+            return a, b, c
+
+        good_a = arange(3, dtype=float)
+        good_b = arange(3).astype('datetime64[ns]')
+        good_c = object()
+
+        a_ret, b_ret, c_ret = foo(good_a, good_b, good_c)
+        self.assertIs(a_ret, good_a)
+        self.assertIs(b_ret, good_b)
+        self.assertIs(c_ret, good_c)
+
+        with self.assertRaises(TypeError) as e:
+            foo(good_a, arange(3, dtype='int64'), good_c)
+
+        expected_message = (
+            "{qualname}() expected a value with dtype 'datetime64[ns]'"
+            " for argument 'b', but got 'int64' instead."
+        ).format(qualname=qualname(foo))
+        self.assertEqual(e.exception.args[0], expected_message)
+
+        with self.assertRaises(TypeError) as e:
+            foo(arange(3, dtype='uint32'), good_c, good_c)
+
+        expected_message = (
+            "{qualname}() expected a value with dtype 'float64'"
+            " for argument 'a', but got 'uint32' instead."
+        ).format(qualname=qualname(foo))
+        self.assertEqual(e.exception.args[0], expected_message)
+
+    def test_expect_dtypes_with_tuple(self):
+
+        allowed_dtypes = (dtype('datetime64[ns]'), dtype('float'))
+
+        @expect_dtypes(a=allowed_dtypes)
+        def foo(a, b):
+            return a, b
+
+        for d in allowed_dtypes:
+            good_a = arange(3).astype(d)
+            good_b = object()
+            ret_a, ret_b = foo(good_a, good_b)
+            self.assertIs(good_a, ret_a)
+            self.assertIs(good_b, ret_b)
+
+        with self.assertRaises(TypeError) as e:
+            foo(arange(3, dtype='uint32'), object())
+
+        expected_message = (
+            "{qualname}() expected a value with dtype 'datetime64[ns]' "
+            "or 'float64' for argument 'a', but got 'uint32' instead."
+        ).format(qualname=qualname(foo))
+        self.assertEqual(e.exception.args[0], expected_message)
+
+    def test_ensure_timezone(self):
+        @preprocess(tz=ensure_timezone)
+        def f(tz):
+            return tz
+
+        valid = {
+            'utc',
+            'EST',
+            'US/Eastern',
+        }
+        invalid = {
+            # unfortunatly, these are not actually timezones (yet)
+            'ayy',
+            'lmao',
+        }
+
+        # test coercing from string
+        for tz in valid:
+            self.assertEqual(f(tz), pytz.timezone(tz))
+
+        # test pass through of tzinfo objects
+        for tz in map(pytz.timezone, valid):
+            self.assertEqual(f(tz), tz)
+
+        # test invalid timezone strings
+        for tz in invalid:
+            self.assertRaises(pytz.UnknownTimeZoneError, f, tz)
+
+    def test_optionally(self):
+        error = TypeError('arg must be int')
+
+        def preprocessor(func, argname, arg):
+            if not isinstance(arg, int):
+                raise error
+            return arg
+
+        @preprocess(a=optionally(preprocessor))
+        def f(a):
+            return a
+
+        self.assertIs(f(1), 1)
+        self.assertIsNone(f(None))
+
+        with self.assertRaises(TypeError) as e:
+            f('a')
+        self.assertIs(e.exception, error)
+
+    def test_expect_dimensions(self):
+
+        @expect_dimensions(x=2)
+        def foo(x, y):
+            return x[0, 0]
+
+        self.assertEqual(foo(arange(1).reshape(1, 1), 10), 0)
+
+        with self.assertRaises(ValueError) as e:
+            foo(arange(1), 1)
+        errmsg = str(e.exception)
+        expected = (
+            "{qualname}() expected a 2-D array for argument 'x', but got"
+            " a 1-D array instead.".format(qualname=qualname(foo))
+        )
+        self.assertEqual(errmsg, expected)
+
+        with self.assertRaises(ValueError) as e:
+            foo(arange(1).reshape(1, 1, 1), 1)
+        errmsg = str(e.exception)
+        expected = (
+            "{qualname}() expected a 2-D array for argument 'x', but got"
+            " a 3-D array instead.".format(qualname=qualname(foo))
+        )
+        self.assertEqual(errmsg, expected)
+
+        with self.assertRaises(ValueError) as e:
+            foo(array(0), 1)
+        errmsg = str(e.exception)
+        expected = (
+            "{qualname}() expected a 2-D array for argument 'x', but got"
+            " a scalar instead.".format(qualname=qualname(foo))
+        )
+        self.assertEqual(errmsg, expected)

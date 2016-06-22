@@ -1,12 +1,11 @@
 .. include:: ../../README.rst
 
-Index
------
-
 .. toctree::
    :maxdepth: 1
 
+   install
    beginner-tutorial
+   bundles
    releases
    appendix
    release-process

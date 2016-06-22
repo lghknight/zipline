@@ -1,6 +1,8 @@
 """
 PipelineLoader accepting a DataFrame as input.
 """
+from functools import partial
+
 from numpy import (
     ix_,
     zeros,
@@ -11,22 +13,11 @@ from pandas import (
     Index,
     Int64Index,
 )
-from zipline.lib.adjusted_array import adjusted_array
-from zipline.lib.adjustment import (
-    Float64Add,
-    Float64Multiply,
-    Float64Overwrite,
-)
-
+from zipline.lib.adjusted_array import AdjustedArray
+from zipline.lib.adjustment import make_adjustment_from_labels
+from zipline.utils.pandas_utils import sort_values
 from .base import PipelineLoader
 
-
-ADD, MULTIPLY, OVERWRITE = range(3)
-ADJUSTMENT_CONSTRUCTORS = {
-    ADD: Float64Add.from_assets_and_dates,
-    MULTIPLY: Float64Multiply.from_assets_and_dates,
-    OVERWRITE: Float64Overwrite.from_assets_and_dates,
-}
 ADJUSTMENT_COLUMNS = Index([
     'sid',
     'value',
@@ -69,7 +60,7 @@ class DataFrameLoader(PipelineLoader):
 
     def __init__(self, column, baseline, adjustments=None):
         self.column = column
-        self.baseline = baseline.values
+        self.baseline = baseline.values.astype(self.column.dtype)
         self.dates = baseline.index
         self.assets = baseline.columns
 
@@ -81,7 +72,7 @@ class DataFrameLoader(PipelineLoader):
         else:
             # Ensure that columns are in the correct order.
             adjustments = adjustments.reindex_axis(ADJUSTMENT_COLUMNS, axis=1)
-            adjustments.sort(['apply_date', 'sid'], inplace=True)
+            sort_values(adjustments, ['apply_date', 'sid'], inplace=True)
 
         self.adjustments = adjustments
         self.adjustment_apply_dates = DatetimeIndex(adjustments.apply_date)
@@ -91,7 +82,7 @@ class DataFrameLoader(PipelineLoader):
     def format_adjustments(self, dates, assets):
         """
         Build a dict of Adjustment objects in the format expected by
-        adjusted_array.
+        AdjustedArray.
 
         Returns a dict of the form:
         {
@@ -105,6 +96,8 @@ class DataFrameLoader(PipelineLoader):
             ...
         }
         """
+        make_adjustment = partial(make_adjustment_from_labels, dates, assets)
+
         min_date, max_date = dates[[0, -1]]
         # TODO: Consider porting this to Cython.
         if len(self.adjustments) == 0:
@@ -148,14 +141,7 @@ class DataFrameLoader(PipelineLoader):
             # Look up the approprate Adjustment constructor based on the value
             # of `kind`.
             current_date_adjustments.append(
-                ADJUSTMENT_CONSTRUCTORS[kind](
-                    dates,
-                    assets,
-                    start_date,
-                    end_date,
-                    sid,
-                    value,
-                ),
+                make_adjustment(start_date, end_date, sid, kind, value)
             )
         return out
 
@@ -163,11 +149,12 @@ class DataFrameLoader(PipelineLoader):
         """
         Load data from our stored baseline.
         """
+        column = self.column
         if len(columns) != 1:
             raise ValueError(
                 "Can't load multiple columns with DataFrameLoader"
             )
-        elif columns[0] != self.column:
+        elif columns[0] != column:
             raise ValueError("Can't load unknown column %s" % columns[0])
 
         date_indexer = self.dates.get_indexer(dates)
@@ -177,11 +164,13 @@ class DataFrameLoader(PipelineLoader):
         good_dates = (date_indexer != -1)
         good_assets = (assets_indexer != -1)
 
-        arrays = [adjusted_array(
-            # Pull out requested columns/rows from our baseline data.
-            data=self.baseline[ix_(date_indexer, assets_indexer)],
-            # Mask out requested columns/rows that didnt match.
-            mask=(good_assets & good_dates[:, None]) & mask,
-            adjustments=self.format_adjustments(dates, assets),
-        )]
-        return dict(zip(columns, arrays))
+        return {
+            column: AdjustedArray(
+                # Pull out requested columns/rows from our baseline data.
+                data=self.baseline[ix_(date_indexer, assets_indexer)],
+                # Mask out requested columns/rows that didnt match.
+                mask=(good_assets & good_dates[:, None]) & mask,
+                adjustments=self.format_adjustments(dates, assets),
+                missing_value=column.missing_value,
+            ),
+        }

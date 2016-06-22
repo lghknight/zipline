@@ -2,18 +2,25 @@
 Base class for Pipeline API  unittests.
 """
 from functools import wraps
-from unittest import TestCase
 
+import numpy as np
 from numpy import arange, prod
 from pandas import date_range, Int64Index, DataFrame
 from six import iteritems
 
-from zipline.finance.trading import TradingEnvironment
+from zipline.assets.synthetic import make_simple_equity_info
 from zipline.pipeline.engine import SimplePipelineEngine
+from zipline.pipeline import TermGraph
 from zipline.pipeline.term import AssetExists
+from zipline.testing import (
+    check_arrays,
+    ExplodingObject,
+    tmp_asset_finder,
+)
+from zipline.testing.fixtures import ZiplineTestCase, WithTradingSchedule
+
+from zipline.utils.functional import dzip_exact
 from zipline.utils.pandas_utils import explode
-from zipline.utils.test_utils import make_simple_equity_info, ExplodingObject
-from zipline.utils.tradingcalendar import trading_day
 
 
 def with_defaults(**default_funcs):
@@ -43,26 +50,25 @@ def with_defaults(**default_funcs):
 with_default_shape = with_defaults(shape=lambda self: self.default_shape)
 
 
-class BasePipelineTestCase(TestCase):
+class BasePipelineTestCase(WithTradingSchedule, ZiplineTestCase):
 
-    def setUp(self):
-        self.__calendar = date_range('2014', '2015', freq=trading_day)
-        self.__assets = assets = Int64Index(arange(1, 20))
+    @classmethod
+    def init_class_fixtures(cls):
+        super(BasePipelineTestCase, cls).init_class_fixtures()
 
-        # Set up env for test
-        env = TradingEnvironment()
-        env.write_data(
-            equities_df=make_simple_equity_info(
+        cls.__calendar = date_range('2014', '2015',
+                                    freq=cls.trading_schedule.day)
+        cls.__assets = assets = Int64Index(arange(1, 20))
+        cls.__tmp_finder_ctx = tmp_asset_finder(
+            equities=make_simple_equity_info(
                 assets,
-                self.__calendar[0],
-                self.__calendar[-1],
-            ),
+                cls.__calendar[0],
+                cls.__calendar[-1],
+            )
         )
-        self.__finder = env.asset_finder
-
-        # Use a 30-day period at the end of the year by default.
-        self.__mask = self.__finder.lifetimes(
-            self.__calendar[-30:],
+        cls.__finder = cls.__tmp_finder_ctx.__enter__()
+        cls.__mask = cls.__finder.lifetimes(
+            cls.__calendar[-30:],
             include_start_date=False,
         )
 
@@ -109,6 +115,16 @@ class BasePipelineTestCase(TestCase):
             initial_workspace,
         )
 
+    def check_terms(self, terms, expected, initial_workspace, mask):
+        """
+        Compile the given terms into a TermGraph, compute it with
+        initial_workspace, and compare the results with ``expected``.
+        """
+        graph = TermGraph(terms)
+        results = self.run_graph(graph, initial_workspace, mask)
+        for key, (res, exp) in dzip_exact(results, expected).items():
+            check_arrays(res, exp)
+
     def build_mask(self, array):
         """
         Helper for constructing an AssetExists mask from a boolean-coercible
@@ -130,3 +146,21 @@ class BasePipelineTestCase(TestCase):
         Build a block of testing data from numpy.arange.
         """
         return arange(prod(shape), dtype=dtype).reshape(shape)
+
+    @with_default_shape
+    def randn_data(self, seed, shape):
+        """
+        Build a block of testing data from a seeded RandomState.
+        """
+        return np.random.RandomState(seed).randn(*shape)
+
+    @with_default_shape
+    def eye_mask(self, shape):
+        """
+        Build a mask using np.eye.
+        """
+        return ~np.eye(*shape, dtype=bool)
+
+    @with_default_shape
+    def ones_mask(self, shape):
+        return np.ones(shape, dtype=bool)

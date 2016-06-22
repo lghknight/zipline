@@ -18,6 +18,7 @@ from cpython cimport (
 )
 
 from numpy import (
+    int64,
     uint32,
     zeros,
 )
@@ -161,6 +162,12 @@ cpdef load_adjustments_from_sqlite(object adjustments_db,  # sqlite3.Connection
         Dates for which adjustments are needed
     assets : pd.Int64Index
         Assets for which adjustments are needed.
+
+    Returns
+    -------
+    adjustments : list[dict[int -> Adjustment]]
+        A list of mappings from index to adjustment objects to apply at that
+        index.
     """
 
     cdef int start_date = int((dates[0] - EPOCH).total_seconds())
@@ -208,7 +215,7 @@ cpdef load_adjustments_from_sqlite(object adjustments_db,  # sqlite3.Connection
         dict col_adjustments
 
     cdef ndarray[int64_t, ndim=1] _dates_seconds = \
-        dates.values.astype('datetime64[s]').view(int)
+        dates.values.astype('datetime64[s]').view(int64)
 
     # Pre-populate date index cache.
     for i, dt in enumerate(_dates_seconds):

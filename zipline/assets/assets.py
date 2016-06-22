@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from pandas import isnull
 from six import with_metaclass, string_types, viewkeys
-from six.moves import map as imap, range
+from six.moves import map as imap
 import sqlalchemy as sa
 
 from zipline.errors import (
@@ -37,13 +37,15 @@ from zipline.assets import (
     Asset, Equity, Future,
 )
 from zipline.assets.asset_writer import (
-    split_delimited_symbol,
     check_version_info,
-    ASSET_DB_VERSION,
+    split_delimited_symbol,
     asset_db_table_names,
-    SQLITE_MAX_VARIABLE_NUMBER
+)
+from zipline.assets.asset_db_schema import (
+    ASSET_DB_VERSION
 )
 from zipline.utils.control_flow import invert
+from zipline.utils.sqlite_utils import group_into_chunks
 
 log = Logger('assets.py')
 
@@ -92,13 +94,15 @@ class AssetFinder(object):
 
     See Also
     --------
-    :class:`zipline.assets.asset_writer.AssetDBWriter`
+    :class:`zipline.assets.AssetDBWriter`
     """
     # Token used as a substitute for pickling objects that contain a
     # reference to an AssetFinder.
     PERSISTENT_TOKEN = "<AssetFinder>"
 
     def __init__(self, engine):
+        if isinstance(engine, string_types):
+            engine = sa.create_engine('sqlite:///' + engine)
 
         self.engine = engine
         metadata = sa.MetaData(bind=engine)
@@ -161,7 +165,7 @@ class AssetFinder(object):
 
         router_cols = self.asset_router.c
 
-        for assets in self._group_into_chunks(missing):
+        for assets in group_into_chunks(missing):
             query = sa.select((router_cols.sid, router_cols.asset_type)).where(
                 self.asset_router.c.sid.in_(map(int, assets))
             )
@@ -173,12 +177,6 @@ class AssetFinder(object):
                 found[sid] = self._asset_type_cache[sid] = None
 
         return found
-
-    @staticmethod
-    def _group_into_chunks(items, chunk_size=SQLITE_MAX_VARIABLE_NUMBER):
-        items = list(items)
-        return [items[x:x+chunk_size]
-                for x in range(0, len(items), chunk_size)]
 
     def group_by_type(self, sids):
         """
@@ -208,7 +206,7 @@ class AssetFinder(object):
 
         Parameters
         ----------
-        sids : interable of int
+        sids : iterable of int
             Assets to retrieve.
         default_none : bool
             If True, return None for failed lookups.
@@ -216,7 +214,7 @@ class AssetFinder(object):
 
         Returns
         -------
-        assets : list[int or None]
+        assets : list[Asset or None]
             A list of the same length as `sids` containing Assets (or Nones)
             corresponding to the requested sids.
 
@@ -356,7 +354,7 @@ class AssetFinder(object):
         cache = self._asset_cache
         hits = {}
 
-        for assets in self._group_into_chunks(sids):
+        for assets in group_into_chunks(sids):
             # Load misses from the db.
             query = self._select_assets_by_sid(asset_tbl, assets)
 
@@ -444,9 +442,9 @@ class AssetFinder(object):
                 self.equities.c.share_class_symbol ==
                 share_class_symbol,
                 self.equities.c.start_date <= ad_value),
-            ).order_by(
-                self.equities.c.end_date.desc(),
-            ).execute().fetchall()
+        ).order_by(
+            self.equities.c.end_date.desc(),
+        ).execute().fetchall()
         return candidates
 
     def _get_best_candidate(self, candidates):
@@ -629,16 +627,26 @@ class AssetFinder(object):
                         )
                     )
                 ).order_by(
-                    # Sort using expiration_date if valid. If it's NaT,
-                    # use notice_date instead.
+                    # If both dates exist sort using minimum of
+                    # expiration_date and notice_date
+                    # else if one is NaT use the other.
                     sa.case(
                         [
                             (
                                 fc_cols.expiration_date == pd.NaT.value,
                                 fc_cols.notice_date
+                            ),
+                            (
+                                fc_cols.notice_date == pd.NaT.value,
+                                fc_cols.expiration_date
                             )
                         ],
-                        else_=fc_cols.expiration_date
+                        else_=(
+                            sa.func.min(
+                                fc_cols.notice_date,
+                                fc_cols.expiration_date
+                            )
+                        )
                     ).asc()
                 ).execute().fetchall()
             ))
@@ -654,12 +662,54 @@ class AssetFinder(object):
         contracts = self.retrieve_futures_contracts(sids)
         return [contracts[sid] for sid in sids]
 
-    @property
-    def sids(self):
-        return tuple(map(
+    def lookup_expired_futures(self, start, end):
+        if not isinstance(start, pd.Timestamp):
+            start = pd.Timestamp(start)
+        start = start.value
+        if not isinstance(end, pd.Timestamp):
+            end = pd.Timestamp(end)
+        end = end.value
+
+        fc_cols = self.futures_contracts.c
+
+        nd = sa.func.nullif(fc_cols.notice_date, pd.tslib.iNaT)
+        ed = sa.func.nullif(fc_cols.expiration_date, pd.tslib.iNaT)
+        date = sa.func.coalesce(sa.func.min(nd, ed), ed, nd)
+
+        sids = list(map(
             itemgetter('sid'),
-            sa.select((self.asset_router.c.sid,)).execute().fetchall(),
+            sa.select((fc_cols.sid,)).where(
+                (date >= start) & (date < end)).order_by(
+                sa.func.coalesce(ed, nd).asc()
+            ).execute().fetchall()
         ))
+
+        return sids
+
+    def _make_sids(tblattr):
+        def _(self):
+            return tuple(map(
+                itemgetter('sid'),
+                sa.select((
+                    getattr(self, tblattr).c.sid,
+                )).execute().fetchall(),
+            ))
+
+        return _
+
+    sids = property(
+        _make_sids('asset_router'),
+        doc='All the sids in the asset finder.',
+    )
+    equities_sids = property(
+        _make_sids('equities'),
+        doc='All of the sids for equities in the asset finder.',
+    )
+    futures_sids = property(
+        _make_sids('futures_contracts'),
+        doc='All of the sids for futures consracts in the asset finder.',
+    )
+    del _make_sids
 
     def _lookup_generic_scalar(self,
                                asset_convertible,
@@ -898,34 +948,35 @@ class NotAssetConvertible(ValueError):
 
 class AssetFinderCachedEquities(AssetFinder):
     """
-    An extension to AssetFinder that loads all equities from equities table
-    into memory and overrides the methods that lookup_symbol uses to look up
-    those equities.
+    An extension to AssetFinder that preloads all equities from equities table
+    into memory and does lookups from there.
+
+    To have any changes in the underlying assets db reflected by this asset
+    finder one must manually call the ``rehash_equities`` method.
     """
+
     def __init__(self, engine):
         super(AssetFinderCachedEquities, self).__init__(engine)
-        self.fuzzy_symbol_hashed_equities = {}
-        self.company_share_class_hashed_equities = {}
-        self.hashed_equities = sa.select(self.equities.c).execute().fetchall()
-        self._load_hashed_equities()
+        self._fuzzy_symbol_cache = {}
+        self._company_share_class_cache = {}
 
-    def _load_hashed_equities(self):
+        self.rehash_equities()
+
+    def rehash_equities(self):
+        """Reload the underlying assets db into the in memory cache.
         """
-        Populates two maps - fuzzy symbol to list of equities having that
-        fuzzy symbol and company symbol/share class symbol to list of
-        equities having that combination of company symbol/share class symbol.
-        """
-        for equity in self.hashed_equities:
+        for equity in sa.select(self.equities.c).execute().fetchall():
             company_symbol = equity['company_symbol']
             share_class_symbol = equity['share_class_symbol']
             fuzzy_symbol = equity['fuzzy_symbol']
             asset = self._convert_row_to_equity(equity)
-            self.company_share_class_hashed_equities.setdefault(
+            self._company_share_class_cache.setdefault(
                 (company_symbol, share_class_symbol),
                 []
             ).append(asset)
-            self.fuzzy_symbol_hashed_equities.setdefault(
-                fuzzy_symbol, []
+            self._fuzzy_symbol_cache.setdefault(
+                fuzzy_symbol,
+                [],
             ).append(asset)
 
     def _convert_row_to_equity(self, row):
@@ -935,7 +986,7 @@ class AssetFinderCachedEquities(AssetFinder):
         return Equity(**_convert_asset_timestamp_fields(dict(row)))
 
     def _get_fuzzy_candidates(self, fuzzy_symbol):
-        return self.fuzzy_symbol_hashed_equities.get(fuzzy_symbol, ())
+        return self._fuzzy_symbol_cache.get(fuzzy_symbol, ())
 
     def _get_fuzzy_candidates_in_range(self, fuzzy_symbol, ad_value):
         return only_active_assets(
@@ -944,7 +995,7 @@ class AssetFinderCachedEquities(AssetFinder):
         )
 
     def _get_split_candidates(self, company_symbol, share_class_symbol):
-        return self.company_share_class_hashed_equities.get(
+        return self._company_share_class_cache.get(
             (company_symbol, share_class_symbol),
             (),
         )
@@ -967,7 +1018,8 @@ class AssetFinderCachedEquities(AssetFinder):
                                         share_class_symbol,
                                         ad_value):
         equities = self._get_split_candidates(
-            company_symbol, share_class_symbol
+            company_symbol,
+            share_class_symbol
         )
         partial_candidates = []
         for equity in equities:

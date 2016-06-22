@@ -20,9 +20,7 @@ from zipline.data.us_equity_pricing import (
     BcolzDailyBarReader,
     SQLiteAdjustmentReader,
 )
-from zipline.lib.adjusted_array import (
-    adjusted_array,
-)
+from zipline.lib.adjusted_array import AdjustedArray
 from zipline.errors import NoFurtherDataError
 
 from .base import PipelineLoader
@@ -71,24 +69,28 @@ class USEquityPricingLoader(PipelineLoader):
         start_date, end_date = _shift_dates(
             self._calendar, dates[0], dates[-1], shift=1,
         )
-
+        colnames = [c.name for c in columns]
         raw_arrays = self.raw_price_loader.load_raw_arrays(
-            columns,
+            colnames,
             start_date,
             end_date,
             assets,
         )
         adjustments = self.adjustments_loader.load_adjustments(
-            columns,
+            colnames,
             dates,
             assets,
         )
-        adjusted_arrays = [
-            adjusted_array(raw_array, mask, col_adjustments)
-            for raw_array, col_adjustments in zip(raw_arrays, adjustments)
-        ]
 
-        return dict(zip(columns, adjusted_arrays))
+        out = {}
+        for c, c_raw, c_adjs in zip(columns, raw_arrays, adjustments):
+            out[c] = AdjustedArray(
+                c_raw.astype(c.dtype),
+                mask,
+                c_adjs,
+                c.missing_value,
+            )
+        return out
 
 
 def _shift_dates(dates, start_date, end_date, shift):

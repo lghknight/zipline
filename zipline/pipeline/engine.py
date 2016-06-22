@@ -12,20 +12,16 @@ from six import (
     with_metaclass,
 )
 from numpy import array
-from pandas import (
-    DataFrame,
-    date_range,
-    MultiIndex,
-)
+from pandas import DataFrame, MultiIndex
 from toolz import groupby, juxt
 from toolz.curried.operator import getitem
 
-from zipline.lib.adjusted_array import ensure_ndarray
+from zipline.lib.adjusted_array import ensure_adjusted_array, ensure_ndarray
 from zipline.errors import NoFurtherDataError
 from zipline.utils.numpy_utils import repeat_first_axis, repeat_last_axis
 from zipline.utils.pandas_utils import explode
 
-from .term import AssetExists
+from .term import AssetExists, LoadableTerm
 
 
 class PipelineEngine(with_metaclass(ABCMeta)):
@@ -51,7 +47,7 @@ class PipelineEngine(with_metaclass(ABCMeta)):
         result : pd.DataFrame
             A frame of computed results.
 
-            The columns `result` correspond will be the computed results of
+            The columns `result` correspond to the entries of
             `pipeline.columns`, which should be a dictionary mapping strings to
             instances of `zipline.pipeline.term.Term`.
 
@@ -63,16 +59,21 @@ class PipelineEngine(with_metaclass(ABCMeta)):
         raise NotImplementedError("run_pipeline")
 
 
-class NoOpPipelineEngine(PipelineEngine):
+class NoEngineRegistered(Exception):
+    """
+    Raised if a user tries to call pipeline_output in an algorithm that hasn't
+    set up a pipeline engine.
+    """
+
+
+class ExplodingPipelineEngine(PipelineEngine):
     """
     A PipelineEngine that doesn't do anything.
     """
     def run_pipeline(self, pipeline, start_date, end_date):
-        return DataFrame(
-            index=MultiIndex.from_product(
-                [date_range(start=start_date, end=end_date, freq='D'), ()],
-            ),
-            columns=sorted(pipeline.columns.keys()),
+        raise NoEngineRegistered(
+            "Attempted to run a pipeline but no pipeline "
+            "resources were registered."
         )
 
 
@@ -83,7 +84,7 @@ class SimplePipelineEngine(object):
     Parameters
     ----------
     get_loader : callable
-        A function that is given an atomic term and returns a PipelineLoader
+        A function that is given a loadable term and returns a PipelineLoader
         to use to retrieve raw data for that term.
     calendar : DatetimeIndex
         Array of dates to consider as trading days when computing a range
@@ -92,13 +93,13 @@ class SimplePipelineEngine(object):
         An AssetFinder instance.  We depend on the AssetFinder to determine
         which assets are in the top-level universe at any point in time.
     """
-    __slots__ = [
+    __slots__ = (
         '_get_loader',
         '_calendar',
         '_finder',
         '_root_mask_term',
         '__weakref__',
-    ]
+    )
 
     def __init__(self, get_loader, calendar, asset_finder):
         self._get_loader = get_loader
@@ -122,31 +123,32 @@ class SimplePipelineEngine(object):
         The algorithm implemented here can be broken down into the following
         stages:
 
-        0. Build a dependency graph of all terms in `terms`.  Topologically
-        sort the graph to determine an order in which we can compute the terms.
+        0. Build a dependency graph of all terms in `pipeline`.  Topologically
+           sort the graph to determine an order in which we can compute the
+           terms.
 
         1. Ask our AssetFinder for a "lifetimes matrix", which should contain,
-        for each date between start_date and end_date, a boolean value for each
-        known asset indicating whether the asset existed on that date.
+           for each date between start_date and end_date, a boolean value for
+           each known asset indicating whether the asset existed on that date.
 
         2. Compute each term in the dependency order determined in (0), caching
-        the results in a a dictionary to that they can be fed into future
-        terms.
+           the results in a a dictionary to that they can be fed into future
+           terms.
 
-        3. For each date, determine the number of assets passing **all**
-        filters. The sum, N, of all these values is the total number of rows in
-        our output frame, so we pre-allocate an output array of length N for
-        each factor in `terms`.
+        3. For each date, determine the number of assets passing
+           pipeline.screen.  The sum, N, of all these values is the total
+           number of rows in our output frame, so we pre-allocate an output
+           array of length N for each factor in `terms`.
 
         4. Fill in the arrays allocated in (3) by copying computed values from
-        our output cache into the corresponding rows.
+           our output cache into the corresponding rows.
 
         5. Stick the values computed in (4) into a DataFrame and return it.
 
-        Step 0 is performed by `zipline.pipeline.graph.TermGraph`.
-        Step 1 is performed in `self._compute_root_mask`.
-        Step 2 is performed in `self.compute_chunk`.
-        Steps 3, 4, and 5 are performed in self._format_factor_matrix.
+        Step 0 is performed by ``Pipeline.to_graph``.
+        Step 1 is performed in ``SimplePipelineEngine._compute_root_mask``.
+        Step 2 is performed in ``SimplePipelineEngine.compute_chunk``.
+        Steps 3, 4, and 5 are performed in ``SimplePiplineEngine._to_narrow``.
 
         See Also
         --------
@@ -164,17 +166,20 @@ class SimplePipelineEngine(object):
         root_mask = self._compute_root_mask(start_date, end_date, extra_rows)
         dates, assets, root_mask_values = explode(root_mask)
 
-        outputs = self.compute_chunk(
+        results = self.compute_chunk(
             graph,
             dates,
             assets,
             initial_workspace={self._root_mask_term: root_mask_values},
         )
 
-        out_dates = dates[extra_rows:]
-        screen_values = outputs.pop(screen_name)
-
-        return self._to_narrow(outputs, screen_values, out_dates, assets)
+        return self._to_narrow(
+            graph.outputs,
+            results,
+            results.pop(screen_name),
+            dates[extra_rows:],
+            assets,
+        )
 
     def _compute_root_mask(self, start_date, end_date, extra_rows):
         """
@@ -236,13 +241,20 @@ class SimplePipelineEngine(object):
         assert shape[0] * shape[1] != 0, 'root mask cannot be empty'
         return ret
 
-    def _mask_and_dates_for_term(self, term, workspace, graph, dates):
+    def _mask_and_dates_for_term(self, term, workspace, graph, all_dates):
         """
         Load mask and mask row labels for term.
         """
         mask = term.mask
-        offset = graph.extra_rows[mask] - graph.extra_rows[term]
-        return workspace[mask][offset:], dates[offset:]
+        mask_offset = graph.extra_rows[mask] - graph.extra_rows[term]
+
+        # This offset is computed against _root_mask_term because that is what
+        # determines the shape of the top-level dates array.
+        dates_offset = (
+            graph.extra_rows[self._root_mask_term] - graph.extra_rows[term]
+        )
+
+        return workspace[mask][mask_offset:], all_dates[dates_offset:]
 
     @staticmethod
     def _inputs_for_term(term, workspace, graph):
@@ -254,37 +266,34 @@ class SimplePipelineEngine(object):
         that input.
         """
         offsets = graph.offset
+        out = []
         if term.windowed:
             # If term is windowed, then all input data should be instances of
             # AdjustedArray.
-            return [
-                workspace[input_].traverse(
-                    window_length=term.window_length,
-                    offset=offsets[term, input_]
+            for input_ in term.inputs:
+                adjusted_array = ensure_adjusted_array(
+                    workspace[input_], input_.missing_value,
                 )
-                for input_ in term.inputs
-            ]
-
-        # If term is not windowed, input_data may be an AdjustedArray or
-        # np.ndarray.  Coerce the former to the latter.
-        out = []
-        for input_ in term.inputs:
-            input_data = ensure_ndarray(workspace[input_])
-            offset = offsets[term, input_]
-            # OPTIMIZATION: Don't make a copy by doing input_data[0:] if
-            # offset is zero.
-            if offset:
-                input_data = input_data[offset:]
-            out.append(input_data)
+                out.append(
+                    adjusted_array.traverse(
+                        window_length=term.window_length,
+                        offset=offsets[term, input_],
+                    )
+                )
+        else:
+            # If term is not windowed, input_data may be an AdjustedArray or
+            # np.ndarray.  Coerce the former to the latter.
+            for input_ in term.inputs:
+                input_data = ensure_ndarray(workspace[input_])
+                offset = offsets[term, input_]
+                # OPTIMIZATION: Don't make a copy by doing input_data[0:] if
+                # offset is zero.
+                if offset:
+                    input_data = input_data[offset:]
+                out.append(input_data)
         return out
 
     def get_loader(self, term):
-        # AssetExists is one of the atomic terms in the graph, so we look up
-        # a loader here when grouping by loader, but since it's already in the
-        # workspace, we don't actually use that group.
-        if term is AssetExists():
-            return None
-
         return self._get_loader(term)
 
     def compute_chunk(self, graph, dates, assets, initial_workspace):
@@ -316,14 +325,14 @@ class SimplePipelineEngine(object):
         # Copy the supplied initial workspace so we don't mutate it in place.
         workspace = initial_workspace.copy()
 
-        # If atomic terms share the same loader and extra_rows, load them all
+        # If loadable terms share the same loader and extra_rows, load them all
         # together.
-        atomic_group_key = juxt(get_loader, getitem(graph.extra_rows))
-        atomic_groups = groupby(atomic_group_key, graph.atomic_terms)
+        loader_group_key = juxt(get_loader, getitem(graph.extra_rows))
+        loader_groups = groupby(loader_group_key, graph.loadable_terms)
 
         for term in graph.ordered():
             # `term` may have been supplied in `initial_workspace`, and in the
-            # future we may pre-compute atomic terms coming from the same
+            # future we may pre-compute loadable terms coming from the same
             # dataset.  In either case, we will already have an entry for this
             # term, which we shouldn't re-compute.
             if term in workspace:
@@ -335,9 +344,9 @@ class SimplePipelineEngine(object):
                 term, workspace, graph, dates
             )
 
-            if term.atomic:
+            if isinstance(term, LoadableTerm):
                 to_load = sorted(
-                    atomic_groups[atomic_group_key(term)],
+                    loader_groups[loader_group_key(term)],
                     key=lambda t: t.dataset
                 )
                 loader = get_loader(term)
@@ -361,14 +370,16 @@ class SimplePipelineEngine(object):
             out[name] = workspace[term][graph_extra_rows[term]:]
         return out
 
-    def _to_narrow(self, data, mask, dates, assets):
+    def _to_narrow(self, terms, data, mask, dates, assets):
         """
         Convert raw computed pipeline results into a DataFrame for public APIs.
 
         Parameters
         ----------
+        terms : dict[str -> Term]
+            Dict mapping column names to terms.
         data : dict[str -> ndarray[ndim=2]]
-            Dict mapping column names to computed results.
+            Dict mapping column names to computed results for those names.
         mask : ndarray[bool, ndim=2]
             Mask array of values to keep.
         dates : ndarray[datetime64, ndim=1]
@@ -390,11 +401,38 @@ class SimplePipelineEngine(object):
         If mask[date, asset] is True, then result.loc[(date, asset), colname]
         will contain the value of data[colname][date, asset].
         """
+        if not mask.any():
+            # Manually handle the empty DataFrame case. This is a workaround
+            # to pandas failing to tz_localize an empty dataframe with a
+            # MultiIndex. It also saves us the work of applying a known-empty
+            # mask to each array.
+            #
+            # Slicing `dates` here to preserve pandas metadata.
+            empty_dates = dates[:0]
+            empty_assets = array([], dtype=object)
+            return DataFrame(
+                data={
+                    name: array([], dtype=arr.dtype)
+                    for name, arr in iteritems(data)
+                },
+                index=MultiIndex.from_arrays([empty_dates, empty_assets]),
+            )
+
         resolved_assets = array(self._finder.retrieve_all(assets))
         dates_kept = repeat_last_axis(dates.values, len(assets))[mask]
         assets_kept = repeat_first_axis(resolved_assets, len(dates))[mask]
+
+        final_columns = {}
+        for name in data:
+            # Each term that computed an output has its postprocess method
+            # called on the filtered result.
+            #
+            # As of Mon May 2 15:38:47 2016, we only use this to convert
+            # LabelArrays into categoricals.
+            final_columns[name] = terms[name].postprocess(data[name][mask])
+
         return DataFrame(
-            data={name: arr[mask] for name, arr in iteritems(data)},
+            data=final_columns,
             index=MultiIndex.from_arrays([dates_kept, assets_kept]),
         ).tz_localize('UTC', level=0)
 
@@ -404,6 +442,7 @@ class SimplePipelineEngine(object):
         """
         root = self._root_mask_term
         clsname = type(self).__name__
+
         # Writing this out explicitly so this errors in testing if we change
         # the name without updating this line.
         compute_chunk_name = self.compute_chunk.__name__
